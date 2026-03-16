@@ -1,0 +1,722 @@
+"""
+Integrated Microgrid System Performance Simulation
+
+This module provides a comprehensive simulation framework for microgrids that:
+1. Initializes all components (generators, batteries, loads, resources)
+2. Creates flexible time indices (15 min, 30 min, 1 hr timesteps)
+3. Generates resource data over the model horizon
+4. Generates load profiles
+5. Runs dispatch algorithm for each timestep
+6. Updates component states
+7. Saves comprehensive performance metrics
+
+Author: simeon
+"""
+
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+from Assignment7 import assignment7_pv_power
+from battery_module import KiBaMBattery
+from Load_model import MicrogridLoad
+from dispatch_model import load_following_algorithm
+from hybrid_model import PVGenerator, DieselGenerator, WindTurbine
+from Assignment6 import SolarSimulatorKigali
+
+
+class MicrogridSimulation:
+    """
+    Complete microgrid simulation framework for performance analysis over time.
+    
+    Supports:
+    - Flexible timesteps (15 min, 30 min, 1 hr, customizable)
+    - Multiple generator types (PV, Wind, Diesel)
+    - Battery storage with degradation
+    - Realistic load profiles
+    - Stochastic resource variability
+    - Comprehensive performance tracking
+    """
+    
+    def __init__(self,
+                 timestep_minutes=60,
+                 num_days=365,
+                 start_date='2026-01-01',
+                 pv_capacity_kwp=500.0,
+                 wind_capacity_kw=200.0,
+                 diesel_capacity_kw=100.0,
+                 diesel_capacity_kva=None,
+                 diesel_power_factor=0.8,
+                 battery_capacity_kwh=500.0,
+                 battery_power_kw=50.0,
+                 base_load_kw=50.0,
+                 load_type='residential',
+                 load_profile_file=None,
+                 dispatch_strategy='load_following'):
+        """
+        Initialize microgrid simulation.
+        
+        Args:
+            timestep_minutes (int): Timestep in minutes (must divide 1440)
+            num_days (int): Simulation duration in days
+            start_date (str): Start date in 'YYYY-MM-DD' format
+            pv_capacity_kwp (float): PV array capacity in kWp
+            wind_capacity_kw (float): Wind turbine capacity in kW
+            diesel_capacity_kw (float): Diesel generator capacity in kW
+            battery_capacity_kwh (float): Battery energy capacity in kWh
+            battery_power_kw (float): Battery power capacity in kW
+            base_load_kw (float): Base load demand in kW
+            load_type (str): 'residential', 'commercial', 'industrial', or 'custom'
+            load_profile_file (str | None): Optional CSV file containing a provided load profile
+            dispatch_strategy (str): 'load_following' or 'cycle_charging'
+        """
+        
+        # Validate timestep
+        if 1440 % timestep_minutes != 0:
+            raise ValueError(f"timestep_minutes ({timestep_minutes}) must divide 1440 evenly")
+        
+        self.timestep_minutes = timestep_minutes
+        self.timestep_hours = timestep_minutes / 60.0
+        self.num_days = num_days
+        self.steps_per_day = 1440 // timestep_minutes
+        self.total_steps = num_days * self.steps_per_day
+        self.dispatch_strategy = dispatch_strategy
+        self.load_profile_file = load_profile_file
+        
+        # Parse start date
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = self.start_date + timedelta(days=num_days)
+        
+        print("="*70)
+        print("MICROGRID SIMULATION INITIALIZATION")
+        print("="*70)
+        print(f"Timestep: {timestep_minutes} minutes")
+        print(f"Simulation period: {self.start_date.date()} to {self.end_date.date()}")
+        print(f"Duration: {num_days} days ({self.total_steps} timesteps)")
+        print(f"Steps per day: {self.steps_per_day}")
+        print()
+        
+        # Initialize components
+        print("Initializing microgrid components...")
+
+        # Allow specifying generator rating in kVA with a power factor (e.g. 60 kVA @ 0.8 PF -> 48 kW)
+        if diesel_capacity_kva is not None:
+            diesel_capacity_kw = diesel_capacity_kva * diesel_power_factor
+
+        self.pv_gen = PVGenerator(array_capacity_kwp=pv_capacity_kwp)
+        self.wind_turbine = WindTurbine(rated_power_kw=wind_capacity_kw)
+        self.diesel_gen = DieselGenerator(
+            standby_kva=diesel_capacity_kva if diesel_capacity_kva is not None else None,
+            prime_kva=diesel_capacity_kva if diesel_capacity_kva is not None else None,
+            standby_kw=diesel_capacity_kw * 1.1,
+            prime_kw=diesel_capacity_kw,
+            power_factor=diesel_power_factor,
+            min_load_factor=0.25
+        )
+        # Use KiBaM battery model (current-based updates) to satisfy assignment requirements
+        self.battery = KiBaMBattery(
+            energy_capacity_kwh=battery_capacity_kwh,
+            power_capacity_kw=battery_power_kw,
+            nominal_voltage=48.0,
+            k_rate=0.1,
+            c_fraction=0.3
+        )
+        self.load_model = MicrogridLoad(base_kw=base_load_kw,
+                                        timestep_minutes=timestep_minutes,
+                                        load_type=load_type,
+                                        base_year=self.start_date.year)
+
+        print(f"  + PV: {pv_capacity_kwp} kWp")
+        print(f"  + Wind: {wind_capacity_kw} kW")
+        if diesel_capacity_kva is not None:
+            print(f"  + Diesel: {diesel_capacity_kva} kVA @ {diesel_power_factor} PF (~ {diesel_capacity_kw:.1f} kW)")
+        else:
+            print(f"  + Diesel: {diesel_capacity_kw} kW")
+        print(f"  + Battery: {battery_capacity_kwh} kWh / {battery_power_kw} kW")
+        print(f"  + Load: {base_load_kw} kW base ({load_type})")
+        print(f"  + Dispatch: {dispatch_strategy}")
+        if load_profile_file:
+            print(f"  + Load profile file: {load_profile_file}")
+        print()
+        
+        # Create time index
+        self.time_index = self._create_time_index()
+        
+        # Initialize results storage
+        self.results = []
+        self.system_states = []
+        self.performance_metrics = {}
+        
+    def _create_time_index(self):
+        """Create time index for simulation with specified timestep resolution."""
+        print("Creating time index...")
+        time_index = pd.date_range(
+            start=self.start_date,
+            end=self.end_date,
+            freq=f"{self.timestep_minutes}min",
+            inclusive='left'
+        )
+        print(f"  + Time index has {len(time_index)} timesteps")
+        return time_index
+    
+    def _generate_solar_data(self):
+        """Generate solar irradiance data using the Assignment 7 meteorological pipeline.
+
+        Uses the Kigali TAG Markov model (Assignment 6) to simulate 1 year of hourly
+        irradiance data, then resamples to the timestep resolution.
+        """
+        print("Generating solar irradiance data (Assignment 7 pipeline)...")
+
+        # Kigali monthly average clearness indices (Kt) from Assignment 6
+        kigali_monthly_kt = [0.545, 0.562, 0.553, 0.56, 0.559, 0.591,
+                             0.581, 0.559, 0.566, 0.545, 0.536, 0.535]
+
+        sim = SolarSimulatorKigali()
+        hourly_irradiance = np.array(sim.run_full_year(kigali_monthly_kt))
+
+        # Resample to match the simulation timestep if not hourly
+        if self.timestep_minutes != 60:
+            original_idx = np.arange(len(hourly_irradiance))
+            target_idx = np.linspace(0, len(hourly_irradiance) - 1, len(self.time_index))
+            irradiance = np.interp(target_idx, original_idx, hourly_irradiance)
+        else:
+            irradiance = hourly_irradiance
+
+        print(f"  + Solar irradiance mean: {np.mean(irradiance):.1f} W/m2")
+        print(f"  + Solar irradiance max: {np.max(irradiance):.1f} W/m2")
+        return irradiance
+    
+    def _generate_wind_data(self, method='synthetic'):
+        """
+        Generate wind speed data over simulation horizon.
+        
+        Args:
+            method (str): 'synthetic' (Weibull-based) or 'random'
+        
+        Returns:
+            numpy array of wind speeds (m/s)
+        """
+        print("Generating wind speed data...")
+        
+        if method == 'synthetic':
+            # Weibull distribution with daily and seasonal variation
+            day_of_year = np.array([d.dayofyear for d in self.time_index])
+            
+            # Seasonal variation in wind (typically higher in winter)
+            seasonal_mean = 7 + 3 * np.sin((day_of_year - 80) * 2 * np.pi / 365)
+            
+            # Daily variation (wind often higher during day)
+            hour_of_day = np.array([d.hour for d in self.time_index])
+            daily_variation = 1.0 + 0.3 * np.sin((hour_of_day - 6) * np.pi / 12)
+            
+            # Generate from Weibull distribution (shape=2, realistic for wind)
+            wind_speed = np.random.weibull(2.0, len(self.time_index))
+            wind_speed = wind_speed * seasonal_mean * daily_variation / 2.0
+            
+        else:  # random method
+            # Simple AR(1) process
+            wind_speed = np.zeros(len(self.time_index))
+            wind_speed[0] = np.random.exponential(7)
+            
+            for i in range(1, len(self.time_index)):
+                wind_speed[i] = 0.8 * wind_speed[i-1] + np.random.normal(3, 2)
+                wind_speed[i] = np.maximum(0, np.minimum(20, wind_speed[i]))
+        
+        print(f"  + Wind speed mean: {np.mean(wind_speed):.1f} m/s")
+        print(f"  + Wind speed max: {np.max(wind_speed):.1f} m/s")
+        return wind_speed
+    
+    def _generate_temperature_data(self):
+        """
+        Generate ambient temperature data over simulation horizon.
+        
+        Returns:
+            numpy array of temperatures (°C)
+        """
+        print("Generating temperature data...")
+        
+        day_of_year = np.array([d.dayofyear for d in self.time_index])
+        hour_of_day = np.array([d.hour for d in self.time_index])
+        
+        # Seasonal temperature variation (sine wave, cold in winter, hot in summer)
+        seasonal = 15 + 15 * np.sin((day_of_year - 80) * 2 * np.pi / 365)
+        
+        # Daily temperature variation (colder at night, warmer during day)
+        daily = 8 * np.sin((hour_of_day - 6) * np.pi / 12)
+        
+        temperature = seasonal + daily + np.random.normal(0, 2, len(self.time_index))
+        
+        print(f"  + Temperature mean: {np.mean(temperature):.1f} C")
+        print(f"  + Temperature range: [{np.min(temperature):.1f}, {np.max(temperature):.1f}] C")
+        return temperature
+    
+    def _generate_load_data(self):
+        """Generate load time series for simulation horizon.
+
+        If a load-profile CSV is provided, that profile is resampled to the
+        selected timestep and repeated across the full simulation year.
+        Otherwise a synthetic load is generated from Load_model.
+        """
+        print("Generating load profile...")
+
+        if self.load_profile_file:
+            load_series = self._load_provided_profile()
+        else:
+            load_series = self.load_model.generate_load(
+                year=self.start_date.year,
+                num_days=self.num_days
+            )
+
+        # Align series length/indices to simulation time index
+        if len(load_series) != len(self.time_index):
+            # Resample/interpolate if needed
+            load_series = load_series.reindex(self.time_index, method='nearest', fill_value=np.nan)
+            load_series = load_series.interpolate(method='time').bfill().ffill()
+
+        load_values = load_series.values
+
+        print(f"  + Load mean: {np.mean(load_values):.1f} kW")
+        print(f"  + Load max: {np.max(load_values):.1f} kW")
+        print(f"  + Load min: {np.min(load_values):.1f} kW")
+        return load_values
+
+    def _load_provided_profile(self):
+        """Load a provided profile and tile it across the simulation horizon.
+
+        Assumption:
+        - If the CSV only contains a representative day (for example Assignment 3),
+          the day is repeated for each day of the annual simulation.
+        """
+        profile_path = Path(self.load_profile_file)
+        profile_df = pd.read_csv(profile_path)
+
+        load_col = next(
+            (col for col in profile_df.columns if 'load' in col.lower()),
+            None
+        )
+        if load_col is None:
+            raise ValueError(f"No load column found in {profile_path}")
+
+        if 'Time' in profile_df.columns:
+            times = pd.to_timedelta(profile_df['Time'].astype(str) + ':00')
+            profile_index = pd.Timestamp('2000-01-01') + times
+        else:
+            base_freq = pd.to_timedelta(self.timestep_minutes, unit='min')
+            profile_index = pd.date_range(
+                start='2000-01-01',
+                periods=len(profile_df),
+                freq=base_freq
+            )
+
+        daily_profile = pd.Series(
+            profile_df[load_col].astype(float).values,
+            index=pd.DatetimeIndex(profile_index),
+            name='Load_kW'
+        ).sort_index()
+
+        simulation_minutes = (
+            self.time_index.hour * 60 + self.time_index.minute
+        ).to_numpy()
+        source_minutes = (
+            (daily_profile.index - daily_profile.index.normalize())
+            .total_seconds() / 60.0
+        ).to_numpy()
+        source_load = daily_profile.values.astype(float)
+
+        # Extend the representative day so interpolation works near midnight.
+        source_minutes = np.concatenate((
+            [source_minutes[-1] - 1440.0],
+            source_minutes,
+            [source_minutes[0] + 1440.0]
+        ))
+        source_load = np.concatenate((
+            [source_load[-1]],
+            source_load,
+            [source_load[0]]
+        ))
+
+        tiled_load = np.interp(
+            simulation_minutes,
+            source_minutes,
+            source_load
+        )
+
+        return pd.Series(tiled_load, index=self.time_index, name='Load_kW')
+    
+    def run_simulation(self, save_results=True, verbose=True):
+        """
+        Run the complete microgrid simulation over the time horizon.
+        
+        Args:
+            save_results (bool): Whether to save results to CSV
+            verbose (bool): Whether to print detailed timestep information
+        
+        Returns:
+            pandas DataFrame with complete simulation results
+        """
+        print("\n" + "="*70)
+        print("RUNNING MICROGRID SIMULATION")
+        print("="*70 + "\n")
+        
+        # Generate resource and load data
+        solar_irradiance = self._generate_solar_data()
+        wind_speed = self._generate_wind_data()
+        temperature = self._generate_temperature_data()
+        load_demand = self._generate_load_data()
+        print()
+        
+        self.results = []
+
+        # Run timestep-by-timestep simulation
+        print("Executing timestep dispatch...")
+        
+        for step, timestamp in enumerate(self.time_index):
+            if verbose and step % max(1, self.steps_per_day) == 0:
+                print(f"  Step {step+1}/{self.total_steps} ({timestamp.date()})")
+            
+            # Step 1: Get resource data
+            pv_state = assignment7_pv_power(
+                timestamp=timestamp,
+                ghi_w_m2=solar_irradiance[step],
+                ambient_temp_c=temperature[step],
+                system_size_w=self.pv_gen.array_capacity_kwp * 1000.0
+            )
+            solar_kw = pv_state['pv_power_w'] / 1000.0
+            
+            wind_kw = self.wind_turbine.power_output(
+                wind_speed=wind_speed[step],
+                temp_c=temperature[step]
+            )
+            
+            # Step 2: Get load
+            load_kw = load_demand[step]
+            
+            # Step 3: Run dispatch algorithm (Priority: Solar → Wind → Battery → Diesel)
+            dispatch = load_following_algorithm(
+                load_kw=load_kw,
+                solar_power_kw=solar_kw,
+                wind_power_kw=wind_kw,
+                battery=self.battery,
+                diesel_generator=self.diesel_gen,
+                battery_operating_cost=0.1,
+                timestep_hr=self.timestep_hours,
+                min_soc=0.4,
+                dispatch_strategy=self.dispatch_strategy
+            )
+            
+            # Step 4: Update system states (battery aging, equipment degradation, etc.)
+            self._update_system_states(step)
+            
+            # Step 5: Record energy balance error for debugging
+            power_balance_kw = dispatch.get('error_kw', 0.0)
+
+            # Step 6: Store results
+            battery_discharge_kw = dispatch.get('battery_discharge_kwh', 0.0) / self.timestep_hours
+            battery_charge_kw = dispatch.get('battery_charge_kwh', 0.0) / self.timestep_hours
+
+            timestep_result = {
+                'timestamp': timestamp,
+                'step': step,
+                'hour_of_year': timestamp.hour + (timestamp.dayofyear - 1) * 24,
+
+                # Demand
+                'load_kw': load_kw,
+                'load_served_kw': dispatch.get('load_served_kw', 0.0),
+                'load_shedding_kw': dispatch.get('load_shedding_kw', 0.0),
+
+                # Resource availability
+                'solar_irradiance_wm2': solar_irradiance[step],
+                'tilted_irradiance_wm2': pv_state['tilted_irradiance_w_m2'],
+                'cell_temperature_c': pv_state['cell_temp_c'],
+                'pv_module_count': pv_state['module_count'],
+                'wind_speed_ms': wind_speed[step],
+                'temperature_c': temperature[step],
+
+                # Generation
+                'solar_generation_kw': solar_kw,
+                'wind_generation_kw': wind_kw,
+                'diesel_generation_kw': dispatch.get('diesel', 0.0),
+                'battery_discharge_kw': battery_discharge_kw,
+                'battery_charge_kw': battery_charge_kw,
+                'curtailment_kw': dispatch.get('curtailment', 0.0),
+                'total_generation_kw': (solar_kw + wind_kw + dispatch.get('diesel', 0.0) + battery_discharge_kw),
+
+                # Energy balance check
+                'power_balance_kw': power_balance_kw,
+
+                # Costs
+                'operating_cost': dispatch.get('operating_cost', 0.0),
+                'fuel_liters': dispatch.get('fuel_liters', 0.0),
+                'fuel_cost': dispatch.get('fuel_liters', 0.0) * 1.50,
+
+                # Equipment status
+                'pv_operating_years': self.pv_gen.operating_years,
+                'diesel_operating_hours': self.diesel_gen.runtime_hours,
+                'battery_soc_before': dispatch.get('battery_soc_before', np.nan),
+                'battery_soc_after': dispatch.get('battery_soc_after', np.nan),
+                'battery_health': self.battery.current_capacity_kwh / self.battery.nominal_capacity_kwh,
+            }
+
+            self.results.append(timestep_result)
+        
+        print(f"\n  + Simulation complete: {len(self.results)} timesteps")
+        
+        # Convert to DataFrame
+        results_df = pd.DataFrame(self.results)
+        
+        # Calculate and display performance metrics
+        self._calculate_performance_metrics(results_df)
+        
+        # Save results
+        if save_results:
+            self._save_results(results_df)
+        
+        return results_df
+    
+    def _update_system_states(self, step):
+        """Update degradation and state of system components."""
+        # Update PV degradation (yearly)
+        if step > 0 and step % (self.steps_per_day * 365) == 0:
+            self.pv_gen.step_year()
+
+        # Update diesel runtime hours (tracked in fuel consumption)
+        # Diesel runtime is incremented in DieselGenerator.fuel_consumption
+
+        # Battery calendar aging (apply once per day)
+        if step % self.steps_per_day == 0:
+            self.battery.apply_calendar_aging(days=1.0)
+            self.battery.complete_cycle()
+    
+    def _calculate_performance_metrics(self, results_df):
+        """Calculate comprehensive performance metrics."""
+        print("\n" + "="*70)
+        print("PERFORMANCE METRICS")
+        print("="*70)
+        
+        metrics = {}
+        
+        # Energy metrics
+        metrics['total_solar_generation_kwh'] = results_df['solar_generation_kw'].sum() * self.timestep_hours
+        metrics['total_wind_generation_kwh'] = results_df['wind_generation_kw'].sum() * self.timestep_hours
+        metrics['total_diesel_generation_kwh'] = results_df['diesel_generation_kw'].sum() * self.timestep_hours
+        metrics['total_battery_discharge_kwh'] = results_df['battery_discharge_kw'].sum() * self.timestep_hours
+        metrics['total_generation_kwh'] = results_df['total_generation_kw'].sum() * self.timestep_hours
+        
+        metrics['total_load_kwh'] = results_df['load_kw'].sum() * self.timestep_hours
+        metrics['total_load_served_kwh'] = results_df['load_served_kw'].sum() * self.timestep_hours
+        metrics['total_load_shedding_kwh'] = results_df['load_shedding_kw'].sum() * self.timestep_hours
+        
+        # Reliability metrics
+        metrics['loss_of_load_hours'] = len(results_df[results_df['load_shedding_kw'] > 0.1])
+        metrics['loss_of_load_probability'] = metrics['loss_of_load_hours'] / len(results_df)
+        metrics['load_served_fraction'] = (metrics['total_load_served_kwh'] / 
+                                          (metrics['total_load_kwh'] + 1e-6))
+        
+        # Renewable metrics
+        total_renewable = (metrics['total_solar_generation_kwh'] + 
+                          metrics['total_wind_generation_kwh'])
+        metrics['renewable_fraction'] = total_renewable / (metrics['total_load_served_kwh'] + 1e-6)
+        
+        # Efficiency metrics
+        metrics['average_battery_soc'] = results_df['battery_soc_after'].mean()
+        metrics['min_battery_soc'] = results_df['battery_soc_after'].min()
+        metrics['max_battery_soc'] = results_df['battery_soc_after'].max()
+        
+        # Cost metrics
+        metrics['total_operating_cost'] = results_df['operating_cost'].sum()
+        metrics['total_fuel_liters'] = results_df['fuel_liters'].sum()
+        metrics['diesel_runtime_hours'] = self.diesel_gen.runtime_hours
+        metrics['unmet_load_fraction'] = (metrics['total_load_shedding_kwh'] /
+                                         (metrics['total_load_kwh'] + 1e-6))
+        metrics['cost_per_kwh_served'] = (metrics['total_operating_cost'] /
+                                         (metrics['total_load_served_kwh'] + 1e-6))
+
+        # Average power
+        metrics['average_load_kw'] = results_df['load_kw'].mean()
+        metrics['peak_load_kw'] = results_df['load_kw'].max()
+        metrics['average_solar_kw'] = results_df['solar_generation_kw'].mean()
+        metrics['average_wind_kw'] = results_df['wind_generation_kw'].mean()
+        
+        # Print metrics
+        print(f"\nSOLAR & WIND ENERGY GENERATION:")
+        print(f"  Total Solar:          {metrics['total_solar_generation_kwh']:>12,.1f} kWh")
+        print(f"  Total Wind:           {metrics['total_wind_generation_kwh']:>12,.1f} kWh")
+        print(f"  Total Diesel:         {metrics['total_diesel_generation_kwh']:>12,.1f} kWh")
+        print(f"  Total Generation:     {metrics['total_generation_kwh']:>12,.1f} kWh")
+        
+        print(f"\nLOAD & RELIABILITY:")
+        print(f"  Total Load Demand:    {metrics['total_load_kwh']:>12,.1f} kWh")
+        print(f"  Total Load Served:    {metrics['total_load_served_kwh']:>12,.1f} kWh")
+        print(f"  Load Shedding:        {metrics['total_load_shedding_kwh']:>12,.1f} kWh")
+        print(f"  Served Fraction:      {metrics['load_served_fraction']:>12.2%}")
+        print(f"  Loss of Load Hours:   {metrics['loss_of_load_hours']:>12.0f} hrs")
+        print(f"  Loss of Load Prob:    {metrics['loss_of_load_probability']:>12.2%}")
+        
+        print(f"\nRENEWABLE PENETRATION:")
+        print(f"  Total Renewable:      {total_renewable:>12,.1f} kWh")
+        print(f"  Renewable Fraction:   {metrics['renewable_fraction']:>12.2%}")
+        
+        print(f"\nBATTERY PERFORMANCE:")
+        print(f"  Average SOC:          {metrics['average_battery_soc']:>12.1f} %")
+        print(f"  Min SOC:              {metrics['min_battery_soc']:>12.1f} %")
+        print(f"  Max SOC:              {metrics['max_battery_soc']:>12.1f} %")
+        
+        print(f"\nECONOMIC PERFORMANCE:")
+        print(f"  Total Op. Cost:       ${metrics['total_operating_cost']:>12,.2f}")
+        print(f"  Total Fuel Used:      {metrics['total_fuel_liters']:>12,.2f} L")
+        print(f"  Diesel Runtime:       {metrics['diesel_runtime_hours']:>12,.1f} h")
+        print(f"  Cost per kWh:         ${metrics['cost_per_kwh_served']:>12,.3f}/kWh")
+
+        print(f"\nRELIABILITY:")
+        print(f"  Unmet Load %:         {metrics['unmet_load_fraction']:>12.2%}")
+        print(f"  Loss of Load Hours:   {metrics['loss_of_load_hours']:>12.0f} hrs")
+        print(f"  Loss of Load Prob:    {metrics['loss_of_load_probability']:>12.2%}")
+
+        print(f"\nLOAD CHARACTERISTICS:")
+        print(f"  Average Load:         {metrics['average_load_kw']:>12.1f} kW")
+        print(f"  Peak Load:            {metrics['peak_load_kw']:>12.1f} kW")
+        
+        print()
+        
+        self.performance_metrics = metrics
+        return metrics
+    
+    def _save_results(self, results_df):
+        """Save simulation results to CSV file."""
+        filename = (f"microgrid_results_{self.timestep_minutes}min_"
+                   f"{self.num_days}days_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        filepath = Path(filename)
+        
+        results_df.to_csv(filepath, index=False)
+        print(f"+ Results saved to: {filepath}")
+        
+        # Also save a summary metrics file
+        metrics_filename = (f"microgrid_metrics_{self.timestep_minutes}min_"
+                           f"{self.num_days}days_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        metrics_df = pd.DataFrame([self.performance_metrics])
+        metrics_df.to_csv(metrics_filename, index=False)
+        print(f"+ Metrics saved to: {metrics_filename}")
+    
+    def plot_results(self, days_to_plot=7, save_figure=True):
+        """
+        Create comprehensive visualization of simulation results.
+        
+        Args:
+            days_to_plot (int): Number of days to plot (from start of simulation)
+            save_figure (bool): Whether to save figure to file
+        """
+        if not self.results:
+            print("No results to plot. Run simulation first.")
+            return
+        
+        results_df = pd.DataFrame(self.results)
+        
+        # Select timeframe
+        timesteps_to_plot = min(days_to_plot * self.steps_per_day, len(results_df))
+        plot_data = results_df.iloc[:timesteps_to_plot].copy()
+        
+        fig, axes = plt.subplots(4, 1, figsize=(14, 10))
+        fig.suptitle(f'Microgrid Performance - {self.timestep_minutes}min Timestep',
+                    fontsize=14, fontweight='bold')
+        
+        # Plot 1: Power generation and demand
+        ax = axes[0]
+        ax.plot(plot_data.index, plot_data['solar_generation_kw'], label='Solar', linewidth=1.5)
+        ax.plot(plot_data.index, plot_data['wind_generation_kw'], label='Wind', linewidth=1.5)
+        ax.plot(plot_data.index, plot_data['diesel_generation_kw'], label='Diesel', linewidth=1.5)
+        ax.plot(plot_data.index, plot_data['load_kw'], label='Load', 
+               linewidth=2, linestyle='--', color='black')
+        ax.set_ylabel('Power (kW)')
+        ax.set_title('Power Generation vs Load')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Battery state of charge
+        ax = axes[1]
+        ax.fill_between(plot_data.index, 0, plot_data['battery_soc_after'], 
+                       alpha=0.6, label='Battery SOC')
+        ax.axhline(y=20, color='red', linestyle='--', label='Min SOC (20%)', linewidth=1)
+        ax.axhline(y=100, color='green', linestyle='--', label='Max SOC (100%)', linewidth=1)
+        ax.set_ylabel('State of Charge (%)')
+        ax.set_title('Battery State of Charge')
+        ax.set_ylim([0, 105])
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 3: Generation mix stacked area
+        ax = axes[2]
+        ax.stackplot(plot_data.index,
+                    plot_data['solar_generation_kw'],
+                    plot_data['wind_generation_kw'],
+                    plot_data['diesel_generation_kw'],
+                    plot_data['battery_discharge_kw'],
+                    labels=['Solar', 'Wind', 'Diesel', 'Battery'],
+                    alpha=0.8)
+        ax.plot(plot_data.index, plot_data['load_kw'], 'k--', linewidth=2, label='Load')
+        ax.set_ylabel('Power (kW)')
+        ax.set_title('Generation Mix (Stacked)')
+        ax.legend(loc='upper right', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 4: Load shedding and reserve margin
+        ax = axes[3]
+        ax.bar(plot_data.index, plot_data['load_shedding_kw'], 
+              label='Load Shedding', color='red', alpha=0.7)
+        ax.set_ylabel('Load Shedding (kW)')
+        ax.set_xlabel('Time (hours)')
+        ax.set_title('Load Shedding Events')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_figure:
+            fig_filename = (f"microgrid_plot_{self.timestep_minutes}min_"
+                          f"{days_to_plot}days_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.png")
+            plt.savefig(fig_filename, dpi=150, bbox_inches='tight')
+            print(f"+ Figure saved to: {fig_filename}")
+        
+        plt.show()
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Run the required hybrid mini-grid simulation for one year
+    # Design parameters:
+    #   - Diesel generator: 60 kVA at 0.8 power factor (≈48 kW prime)
+    #   - PV array: 100 kWp
+    #   - Battery: 200 kWh (power 60 kW)
+    #   - Load: uses the provided assignment3_data.csv profile, repeated daily
+    #   - Dispatch: load following by default; switch to 'cycle_charging' if needed
+
+    print("\n" + "="*70)
+    print("HYBRID MINI-GRID SIMULATION (1 YEAR)")
+    print("="*70 + "\n")
+
+    sim = MicrogridSimulation(
+        timestep_minutes=60,
+        num_days=365,
+        start_date='2026-01-01',
+        pv_capacity_kwp=100.0,
+        wind_capacity_kw=0.0,  # No wind for this design case
+        diesel_capacity_kva=60.0,
+        diesel_power_factor=0.8,
+        battery_capacity_kwh=200.0,
+        battery_power_kw=60.0,
+        base_load_kw=40.0,
+        load_type='residential',
+        load_profile_file='assignment3_data.csv',
+        dispatch_strategy='load_following'
+    )
+
+    results = sim.run_simulation(save_results=True, verbose=False)
+    sim.plot_results(days_to_plot=14, save_figure=True)
+
+
+    print("\n" + "="*70)
+    print("SIMULATION COMPLETE")
+    print("="*70)
