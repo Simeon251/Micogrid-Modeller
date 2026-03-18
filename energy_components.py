@@ -5,6 +5,7 @@ Currently implemented:
 - PVGenerator
 - DieselGenerator
 - WindTurbine
+- HydroTurbine
 
 The project is structured so additional source models can be added over time.
 """
@@ -185,4 +186,54 @@ class WindTurbine:
             "end_of_life": self.operating_years >= self.lifetime_years,
             "rated_power_kw": self.rated_power_kw,
             "hub_height_m": self.hub_height_m,
+        }
+
+
+class HydroTurbine:
+    def __init__(
+        self,
+        rated_power_kw=0.0,
+        design_flow_m3s=1.0,
+        net_head_m=20.0,
+        efficiency=0.85,
+        min_flow_fraction=0.2,
+        environmental_flow_m3s=0.0,
+        lifetime_years=40,
+    ):
+        """Run-of-river style hydro turbine driven by flow and head."""
+        self.rated_power_kw = rated_power_kw
+        self.design_flow_m3s = max(design_flow_m3s, 1e-6)
+        self.net_head_m = net_head_m
+        self.efficiency = efficiency
+        self.min_flow_fraction = min_flow_fraction
+        self.environmental_flow_m3s = max(environmental_flow_m3s, 0.0)
+        self.lifetime_years = lifetime_years
+        self.operating_years = 0.0
+
+    def power_output(self, flow_m3s, head_m=None):
+        """Compute electrical power from available flow."""
+        head = self.net_head_m if head_m is None else head_m
+        usable_flow = max(flow_m3s - self.environmental_flow_m3s, 0.0)
+        if usable_flow <= 0:
+            return 0.0
+
+        min_flow = self.min_flow_fraction * self.design_flow_m3s
+        if usable_flow < min_flow:
+            return 0.0
+
+        rho = 1000.0
+        g = 9.81
+        hydraulic_power_kw = rho * g * usable_flow * max(head, 0.0) * self.efficiency / 1000.0
+        return min(self.rated_power_kw, hydraulic_power_kw)
+
+    def step_year(self):
+        self.operating_years += 1.0
+
+    def status(self):
+        return {
+            "operating_years": self.operating_years,
+            "end_of_life": self.operating_years >= self.lifetime_years,
+            "rated_power_kw": self.rated_power_kw,
+            "design_flow_m3s": self.design_flow_m3s,
+            "net_head_m": self.net_head_m,
         }
