@@ -294,7 +294,7 @@ class MicrogridSimulation:
             self.battery.energy_capacity_kwh * econ['battery_fixed_om_per_kwh_year']
         )
 
-        annual_battery_throughput_kwh = annual_metrics['total_battery_discharge_kwh']
+        annual_battery_throughput_kwh = annual_metrics['total_battery_throughput_kwh']
         battery_replacement_interval = self._estimate_battery_replacement_interval_years(
             annual_battery_throughput_kwh
         )
@@ -351,7 +351,7 @@ class MicrogridSimulation:
                 year
             )
             battery_variable_om_cost = self._escalated_cost(
-                annual_metrics['total_battery_discharge_kwh'] * econ['battery_variable_om_per_kwh'],
+                annual_metrics['total_battery_throughput_kwh'] * econ['battery_variable_om_per_kwh'],
                 econ['om_escalation_rate'],
                 year
             )
@@ -866,6 +866,9 @@ class MicrogridSimulation:
                 'load_kw': load_kw,
                 'load_served_kw': dispatch.get('load_served_kw', 0.0),
                 'load_shedding_kw': dispatch.get('load_shedding_kw', 0.0),
+                'renewable_served_kw': dispatch.get('renewable_served_kwh', 0.0) / self.timestep_hours,
+                'battery_served_kw': dispatch.get('battery_served_kwh', 0.0) / self.timestep_hours,
+                'diesel_served_kw': dispatch.get('diesel_served_kwh', 0.0) / self.timestep_hours,
 
                 # Resource availability
                 'solar_irradiance_wm2': solar_irradiance[step],
@@ -885,7 +888,8 @@ class MicrogridSimulation:
                 'battery_discharge_kw': battery_discharge_kw,
                 'battery_charge_kw': battery_charge_kw,
                 'curtailment_kw': dispatch.get('curtailment', 0.0),
-                'total_generation_kw': (solar_kw + wind_kw + hydro_kw + dispatch.get('diesel', 0.0) + battery_discharge_kw),
+                'total_generation_kw': (solar_kw + wind_kw + hydro_kw + dispatch.get('diesel', 0.0)),
+                'total_supply_kw': (solar_kw + wind_kw + hydro_kw + dispatch.get('diesel', 0.0) + battery_discharge_kw),
 
                 # Energy balance check
                 'power_balance_kw': power_balance_kw,
@@ -953,12 +957,18 @@ class MicrogridSimulation:
         metrics['total_wind_generation_kwh'] = results_df['wind_generation_kw'].sum() * self.timestep_hours
         metrics['total_hydro_generation_kwh'] = results_df['hydro_generation_kw'].sum() * self.timestep_hours
         metrics['total_diesel_generation_kwh'] = results_df['diesel_generation_kw'].sum() * self.timestep_hours
+        metrics['total_battery_charge_kwh'] = results_df['battery_charge_kw'].sum() * self.timestep_hours
         metrics['total_battery_discharge_kwh'] = results_df['battery_discharge_kw'].sum() * self.timestep_hours
+        metrics['total_battery_throughput_kwh'] = self.battery.total_throughput_mwh * 1000.0
         metrics['total_generation_kwh'] = results_df['total_generation_kw'].sum() * self.timestep_hours
+        metrics['total_supply_kwh'] = results_df['total_supply_kw'].sum() * self.timestep_hours
         
         metrics['total_load_kwh'] = results_df['load_kw'].sum() * self.timestep_hours
         metrics['total_load_served_kwh'] = results_df['load_served_kw'].sum() * self.timestep_hours
         metrics['total_load_shedding_kwh'] = results_df['load_shedding_kw'].sum() * self.timestep_hours
+        metrics['total_renewable_served_kwh'] = results_df['renewable_served_kw'].sum() * self.timestep_hours
+        metrics['total_battery_served_kwh'] = results_df['battery_served_kw'].sum() * self.timestep_hours
+        metrics['total_diesel_served_kwh'] = results_df['diesel_served_kw'].sum() * self.timestep_hours
         metrics['simulated_years'] = self.simulated_years
 
         # Reliability metrics
@@ -973,15 +983,15 @@ class MicrogridSimulation:
         total_renewable = (metrics['total_solar_generation_kwh'] + 
                           metrics['total_wind_generation_kwh'] +
                           metrics['total_hydro_generation_kwh'])
-        metrics['renewable_fraction'] = min(
-            1.0,
-            total_renewable / (metrics['total_load_served_kwh'] + 1e-6)
+        metrics['renewable_fraction'] = (
+            metrics['total_renewable_served_kwh'] / (metrics['total_load_served_kwh'] + 1e-6)
         )
         
         # Efficiency metrics
         metrics['average_battery_soc'] = results_df['battery_soc_after'].mean()
         metrics['min_battery_soc'] = results_df['battery_soc_after'].min()
         metrics['max_battery_soc'] = results_df['battery_soc_after'].max()
+        metrics['battery_min_soc_percent'] = self.battery.get_min_soc() * 100.0
         
         # Cost metrics
         metrics['total_operating_cost'] = results_df['operating_cost'].sum()
@@ -1005,12 +1015,18 @@ class MicrogridSimulation:
             'total_solar_generation_kwh',
             'total_wind_generation_kwh',
             'total_hydro_generation_kwh',
+            'total_battery_charge_kwh',
             'total_diesel_generation_kwh',
             'total_battery_discharge_kwh',
+            'total_battery_throughput_kwh',
             'total_generation_kwh',
+            'total_supply_kwh',
             'total_load_kwh',
             'total_load_served_kwh',
             'total_load_shedding_kwh',
+            'total_renewable_served_kwh',
+            'total_battery_served_kwh',
+            'total_diesel_served_kwh',
             'total_operating_cost',
             'total_fuel_liters',
             'diesel_runtime_hours',
@@ -1025,6 +1041,7 @@ class MicrogridSimulation:
             'total_fuel_liters': metrics['annual_total_fuel_liters'],
             'total_diesel_generation_kwh': metrics['annual_total_diesel_generation_kwh'],
             'total_battery_discharge_kwh': metrics['annual_total_battery_discharge_kwh'],
+            'total_battery_throughput_kwh': metrics['annual_total_battery_throughput_kwh'],
             'diesel_runtime_hours': metrics['annual_diesel_runtime_hours'],
         })
         self.economic_cashflow = lifecycle_cashflow
@@ -1048,6 +1065,7 @@ class MicrogridSimulation:
         print(f"  Total Hydro:          {metrics['total_hydro_generation_kwh']:>12,.1f} kWh")
         print(f"  Total Diesel:         {metrics['total_diesel_generation_kwh']:>12,.1f} kWh")
         print(f"  Total Generation:     {metrics['total_generation_kwh']:>12,.1f} kWh")
+        print(f"  Total Supply:         {metrics['total_supply_kwh']:>12,.1f} kWh")
         
         print(f"\nLOAD & RELIABILITY:")
         print(f"  Total Load Demand:    {metrics['total_load_kwh']:>12,.1f} kWh")
@@ -1058,7 +1076,8 @@ class MicrogridSimulation:
         print(f"  Loss of Load Prob:    {metrics['loss_of_load_probability']:>12.2%}")
         
         print(f"\nRENEWABLE PENETRATION:")
-        print(f"  Total Renewable:      {total_renewable:>12,.1f} kWh")
+        print(f"  Gross Renewable:      {total_renewable:>12,.1f} kWh")
+        print(f"  Renewable Served:     {metrics['total_renewable_served_kwh']:>12,.1f} kWh")
         print(f"  Renewable Fraction:   {metrics['renewable_fraction']:>12.2%}")
         
         print(f"\nBATTERY PERFORMANCE:")
@@ -1150,7 +1169,14 @@ class MicrogridSimulation:
         ax = axes[1]
         ax.fill_between(plot_data.index, 0, plot_data['battery_soc_after'], 
                        alpha=0.6, label='Battery SOC')
-        ax.axhline(y=20, color='red', linestyle='--', label='Min SOC (20%)', linewidth=1)
+        min_soc_percent = self.battery.get_min_soc() * 100.0
+        ax.axhline(
+            y=min_soc_percent,
+            color='red',
+            linestyle='--',
+            label=f'Min SOC ({min_soc_percent:.0f}%)',
+            linewidth=1
+        )
         ax.axhline(y=100, color='green', linestyle='--', label='Max SOC (100%)', linewidth=1)
         ax.set_ylabel('State of Charge (%)')
         ax.set_title('Battery State of Charge')
