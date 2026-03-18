@@ -24,6 +24,9 @@ def load_following_algorithm(load_kw,
         'battery_charge_kwh': 0.0,
         'load_served_kw': 0.0,
         'load_shedding_kw': 0.0,
+        'renewable_served_kwh': 0.0,
+        'battery_served_kwh': 0.0,
+        'diesel_served_kwh': 0.0,
         'curtailment': 0.0,
         'operating_cost': 0.0,
         'battery_soc_before': battery.get_soc() * 100,
@@ -36,12 +39,13 @@ def load_following_algorithm(load_kw,
     solar_kwh = solar_power_kw * timestep_hr
     wind_kwh = wind_power_kw * timestep_hr
     hydro_kwh = hydro_power_kw * timestep_hr
+    renewable_kwh = solar_kwh + wind_kwh + hydro_kwh
 
     dispatch['solar'] = solar_power_kw
     dispatch['wind'] = wind_power_kw
     dispatch['hydro'] = hydro_power_kw
 
-    supply_kwh = solar_kwh + wind_kwh + hydro_kwh
+    supply_kwh = renewable_kwh
 
     # Use the battery before diesel when renewables cannot fully meet demand.
     deficit_kwh = max(0.0, load_kwh - supply_kwh)
@@ -79,6 +83,13 @@ def load_following_algorithm(load_kw,
     load_shedding_kwh = max(0.0, load_kwh - supply_kwh)
     dispatch['load_served_kw'] = load_served_kwh / timestep_hr
     dispatch['load_shedding_kw'] = load_shedding_kwh / timestep_hr
+    dispatch['renewable_served_kwh'] = min(load_kwh, renewable_kwh)
+    remaining_after_renewables = max(0.0, load_served_kwh - dispatch['renewable_served_kwh'])
+    dispatch['battery_served_kwh'] = min(remaining_after_renewables, dispatch['battery_discharge_kwh'])
+    dispatch['diesel_served_kwh'] = max(
+        0.0,
+        load_served_kwh - dispatch['renewable_served_kwh'] - dispatch['battery_served_kwh']
+    )
 
     supply_after_load_kwh = max(0.0, supply_kwh - load_served_kwh)
     if supply_after_load_kwh > 1e-6:
