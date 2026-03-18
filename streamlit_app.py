@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 
-def build_timeseries_figure(results_df, days_to_plot, steps_per_day):
+def build_timeseries_figure(results_df, days_to_plot, steps_per_day, battery_min_soc_percent):
     timesteps_to_plot = min(days_to_plot * steps_per_day, len(results_df))
     plot_data = results_df.iloc[:timesteps_to_plot].copy()
     x_axis = plot_data["timestamp"]
@@ -31,7 +31,13 @@ def build_timeseries_figure(results_df, days_to_plot, steps_per_day):
     axes[0].legend(loc="upper right", ncol=4)
 
     axes[1].fill_between(x_axis, 0, plot_data["battery_soc_after"], color="#16a34a", alpha=0.5)
-    axes[1].axhline(40, color="#b91c1c", linestyle="--", linewidth=1, label="Dispatch Min SOC")
+    axes[1].axhline(
+        battery_min_soc_percent,
+        color="#b91c1c",
+        linestyle="--",
+        linewidth=1,
+        label=f"Min SOC ({battery_min_soc_percent:.0f}%)",
+    )
     axes[1].set_title("Battery State of Charge")
     axes[1].set_ylabel("SOC (%)")
     axes[1].set_ylim(0, 105)
@@ -365,7 +371,15 @@ if run_simulation:
     with tab1:
         left, right = st.columns([2, 1])
         with left:
-            st.pyplot(build_timeseries_figure(results_df, days_to_plot, sim.steps_per_day), use_container_width=True)
+            st.pyplot(
+                build_timeseries_figure(
+                    results_df,
+                    days_to_plot,
+                    sim.steps_per_day,
+                    metrics["battery_min_soc_percent"],
+                ),
+                use_container_width=True,
+            )
         with right:
             st.pyplot(build_energy_mix_figure(metrics), use_container_width=True)
             st.dataframe(
