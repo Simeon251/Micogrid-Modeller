@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-class SolarSimulatorKigali:
+class SolarResourceSimulator:
     """
     This class simulates hourly solar irradiance for Kigali using a Markov chain model for daily Kt values and the TAG model for hourly distribution."""
     def __init__(self, lat=-1.94, lon=30.06): #longitude in case we need it for future extensions
@@ -101,7 +101,7 @@ class SolarSimulatorKigali:
 
 if __name__ == "__main__":
     kigali_monthly_kt = [0.545, 0.562, 0.553, 0.56, 0.559, 0.591, 0.581, 0.559, 0.566, 0.545, 0.536, 0.535]
-    sim = SolarSimulatorKigali()
+    sim = SolarResourceSimulator()
     hourly_data = sim.run_full_year(kigali_monthly_kt)
     df = pd.DataFrame({'Hour': range(len(hourly_data)), 'G_h_W_m2': hourly_data})
     print(df.head(24))

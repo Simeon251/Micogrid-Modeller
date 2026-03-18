@@ -10,11 +10,22 @@ LAT = -1.94        # Kigali latitude
 TILT = radians(15) # panel tilt
 ALBEDO = 0.2
 
-ETA_REF = 0.18
-TEMP_COEFF = 0.004
-NOCT = 45
+ETA_REF = 0.165
+TEMP_COEFF = 0.00408
+NOCT = 46
 
 SYSTEM_SIZE = 100000  # 100 kWp
+
+# Example module datasheet values: Astronergy CHSM6612P-320.
+MODULE_STC_W = 320.0
+MODULE_VMPP_STC = 35.86
+MODULE_IMPP_STC = 8.93
+MODULE_VOC_STC = 45.68
+MODULE_ISC_STC = 9.06
+MODULE_FF_STC = (MODULE_VMPP_STC * MODULE_IMPP_STC) / (MODULE_VOC_STC * MODULE_ISC_STC)
+VOC_TEMP_COEFF_REL = -0.00311
+# Not listed directly in the datasheet, so this remains an explicit assumption.
+FF_TEMP_COEFF_REL = -0.0005
 
 # EXTRATERRESTRIAL RADIATION
 def extraterrestrial_hour(day_of_year, hour):
@@ -153,45 +164,38 @@ def pv_power_efficiency_model(Gt, Tc):
 def pv_power_fillfactor(Gt, Tc):
     """Fill-factor based PV model.
 
-    Assumptions (module-level reference values):
-    - Module STC power P_stc = 400 W
-    - Isc_stc = 10.5 A
-    - Voc_stc = 48.0 V
-    - FF_stc = 0.78
-    - Voc temperature coefficient = -0.0025 / °C (relative)
-    - FF temperature degradation ~ -0.0005 / °C
+    Module values come from the CHSM6612P-320 datasheet:
+    - Pmpp = 320 W
+    - Vmpp = 35.86 V
+    - Impp = 8.93 A
+    - Voc = 45.68 V
+    - Isc = 9.06 A
+    - FF_stc = Vmpp * Impp / (Voc * Isc)
+    - Voc temperature coefficient = -0.311 %/K
+    - FF temperature coefficient remains an explicit modeling assumption
 
     The model computes Isc proportional to irradiance, Voc adjusted by temperature,
     and P_module = Voc * Isc * FF. The array size SYSTEM_SIZE (W) sets number
     of modules = SYSTEM_SIZE / P_stc.
     """
-    # reference module
-    P_stc = 400.0
-    Isc_stc = 10.5
-    Voc_stc = 48.0
-    FF_stc = 0.78
-
-    # temperature coefficients
-    voc_coeff = -0.0025  # relative per degC
-    ff_coeff = -0.0005
-
-    # number of modules to reach SYSTEM_SIZE Wp
-    n_modules = max(1, int(round(SYSTEM_SIZE / P_stc)))
+    # CHSM6612P-320 datasheet parameters
+    n_modules = max(1, int(np.ceil(SYSTEM_SIZE / MODULE_STC_W)))
 
     # irradiance ratio (STC=1000 W/m2)
     irr_ratio = max(Gt / 1000.0, 0.0)
 
-    Isc = Isc_stc * irr_ratio
-    Voc = Voc_stc * (1 + voc_coeff * (Tc - 25.0))
-    FF = FF_stc * (1 + ff_coeff * (Tc - 25.0))
+    Isc = MODULE_ISC_STC * irr_ratio
+    Voc = MODULE_VOC_STC * (1 + VOC_TEMP_COEFF_REL * (Tc - 25.0))
+    FF = MODULE_FF_STC * (1 + FF_TEMP_COEFF_REL * (Tc - 25.0))
+    FF = max(0.0, FF)
 
     P_module = Voc * Isc * FF
     P_array = P_module * n_modules
     return max(P_array, 0.0)
 
 
-def assignment7_pv_power(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_SIZE):
-    """Assignment 7 PV pipeline for one timestamp.
+def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_SIZE):
+    """PV performance pipeline for one timestamp.
 
     Starting from horizontal irradiance, this applies:
     1. extraterrestrial radiation / solar position
@@ -220,8 +224,8 @@ def assignment7_pv_power(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYST
     finally:
         SYSTEM_SIZE = previous_system_size
 
-    module_stc_w = 400.0
-    module_count = max(1, int(round(system_size_w / module_stc_w)))
+    module_stc_w = MODULE_STC_W
+    module_count = max(1, int(np.ceil(system_size_w / module_stc_w)))
 
     return {
         "ghi_w_m2": ghi_w_m2,
@@ -232,13 +236,15 @@ def assignment7_pv_power(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYST
         "cell_temp_c": cell_temp_c,
         "pv_power_w": pv_power_w,
         "module_count": module_count,
+        "module_stc_w": module_stc_w,
+        "module_ff_stc": MODULE_FF_STC,
     }
 
-def run_assignment7_from_power_file(
+def run_pv_simulation_from_power_file(
     file_path="POWER_Point_Daily_20250101_20251231_001d94S_030d06E_LST.csv",
     output_path="pv_simulation_output.csv",
 ):
-    """Run the original Assignment 7 workflow from the NASA/POWER daily file."""
+    """Run the PV workflow from a NASA/POWER daily file."""
     header_row = 0
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -295,6 +301,6 @@ def run_assignment7_from_power_file(
 
 
 if __name__ == "__main__":
-    df = run_assignment7_from_power_file()
+    df = run_pv_simulation_from_power_file()
     annual_energy = df["PV_Power_W"].sum() / 1000.0
     print("Annual PV Energy (kWh):", annual_energy)

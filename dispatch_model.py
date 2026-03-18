@@ -1,6 +1,6 @@
 
 import pandas as pd
-from hybrid_model import DieselGenerator, WindTurbine, PVGenerator
+from energy_components import DieselGenerator, WindTurbine, PVGenerator
 from battery_module import LeadAcidBattery, KiBaMBattery
 
 def load_following_algorithm(load_kw,
@@ -203,42 +203,6 @@ if __name__ == "__main__":
         else:
             print(f"  {key}: {value:.3f}")
     
-    # Simulation example if assignment3_data.csv exists
-
-        df = pd.read_csv('assignment3_data.csv')
-        print("\n" + "=" * 60)
-        print("FULL SIMULATION RESULTS")
-        print("=" * 60)
-        
-        # Create PV generator and wind turbine
-        pv_gen = PVGenerator(array_capacity_kwp=100.0)
-        wind_turbine = WindTurbine(rated_power_kw=50.0)
-        
-        # Reset battery for simulation
-        battery = LeadAcidBattery(
-            energy_capacity_kwh=500.0,
-            power_capacity_kw=100.0
-        )
-        
-        results_df = run_dispatch_simulation(
-            df,
-            pv_gen=pv_gen,
-            wind_turbine=wind_turbine,
-            battery=battery,
-            diesel_generator=diesel_gen,
-            battery_operating_cost=0.1
-        )
-        
-        print(results_df.head(10))
-        print(f"\nTotal timesteps: {len(results_df)}")
-        print(f"Total operating cost: ${results_df['operating_cost'].sum():.2f}")
-        print(f"Total solar energy: {results_df['solar'].sum():.2f} kWh (available: {results_df['solar_available'].sum():.2f} kWh)")
-        print(f"Total wind energy: {results_df['wind'].sum():.2f} kWh (available: {results_df['wind_available'].sum():.2f} kWh)")
-        print(f"Total diesel energy: {results_df['diesel'].sum():.2f} kWh")
-        print(f"Total battery discharge: {results_df['battery'].sum():.2f} kWh")
-        print(f"Total load shedding: {results_df['shedding'].sum():.2f} kWh")
-        print(f"Total load demand: {results_df['load'].sum():.2f} kWh")
-        print(f"Final battery SOC: {results_df['battery_soc_after'].iloc[-1]:.1f}%")
 
 
 

@@ -10,7 +10,6 @@ This module provides a comprehensive simulation framework for microgrids that:
 6. Updates component states
 7. Saves comprehensive performance metrics
 
-Author: simeon
 """
 
 import numpy as np
@@ -19,12 +18,12 @@ from datetime import timedelta
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from Assignment7 import assignment7_pv_power
+from solar_pv_model import pv_power_from_ghi
 from battery_module import KiBaMBattery
-from Load_model import MicrogridLoad
+from demand_model import MicrogridLoad
 from dispatch_model import load_following_algorithm
-from hybrid_model import PVGenerator, DieselGenerator, WindTurbine
-from Assignment6 import SolarSimulatorKigali
+from energy_components import PVGenerator, DieselGenerator, WindTurbine
+from solar_resource_model import SolarResourceSimulator
 
 
 class MicrogridSimulation:
@@ -54,7 +53,13 @@ class MicrogridSimulation:
                  base_load_kw=50.0,
                  load_type='residential',
                  load_profile_file=None,
-                 dispatch_strategy='load_following'):
+                 dispatch_strategy='load_following',
+                 pv_params=None,
+                 wind_params=None,
+                 diesel_params=None,
+                 battery_params=None,
+                 load_params=None,
+                 random_seed=None):
         """
         Initialize microgrid simulation.
         
@@ -71,6 +76,12 @@ class MicrogridSimulation:
             load_type (str): 'residential', 'commercial', 'industrial', or 'custom'
             load_profile_file (str | None): Optional CSV file containing a provided load profile
             dispatch_strategy (str): 'load_following' or 'cycle_charging'
+            pv_params (dict | None): Optional PV datasheet/model overrides
+            wind_params (dict | None): Optional wind turbine datasheet/model overrides
+            diesel_params (dict | None): Optional diesel generator datasheet/model overrides
+            battery_params (dict | None): Optional battery model overrides
+            load_params (dict | None): Optional load model overrides
+            random_seed (int | None): Optional random seed for repeatable runs
         """
         
         # Validate timestep
@@ -84,6 +95,10 @@ class MicrogridSimulation:
         self.total_steps = num_days * self.steps_per_day
         self.dispatch_strategy = dispatch_strategy
         self.load_profile_file = load_profile_file
+        self.random_seed = random_seed
+
+        if random_seed is not None:
+            np.random.seed(random_seed)
         
         # Parse start date
         self.start_date = pd.to_datetime(start_date)
@@ -105,28 +120,49 @@ class MicrogridSimulation:
         if diesel_capacity_kva is not None:
             diesel_capacity_kw = diesel_capacity_kva * diesel_power_factor
 
-        self.pv_gen = PVGenerator(array_capacity_kwp=pv_capacity_kwp)
-        self.wind_turbine = WindTurbine(rated_power_kw=wind_capacity_kw)
-        self.diesel_gen = DieselGenerator(
-            standby_kva=diesel_capacity_kva if diesel_capacity_kva is not None else None,
-            prime_kva=diesel_capacity_kva if diesel_capacity_kva is not None else None,
-            standby_kw=diesel_capacity_kw * 1.1,
-            prime_kw=diesel_capacity_kw,
-            power_factor=diesel_power_factor,
-            min_load_factor=0.25
-        )
-        # Use KiBaM battery model (current-based updates) to satisfy assignment requirements
-        self.battery = KiBaMBattery(
-            energy_capacity_kwh=battery_capacity_kwh,
-            power_capacity_kw=battery_power_kw,
-            nominal_voltage=48.0,
-            k_rate=0.1,
-            c_fraction=0.3
-        )
-        self.load_model = MicrogridLoad(base_kw=base_load_kw,
-                                        timestep_minutes=timestep_minutes,
-                                        load_type=load_type,
-                                        base_year=self.start_date.year)
+        pv_config = {'array_capacity_kwp': pv_capacity_kwp}
+        if pv_params:
+            pv_config.update(pv_params)
+        self.pv_gen = PVGenerator(**pv_config)
+
+        wind_config = {'rated_power_kw': wind_capacity_kw}
+        if wind_params:
+            wind_config.update(wind_params)
+        self.wind_turbine = WindTurbine(**wind_config)
+
+        diesel_config = {
+            'standby_kva': diesel_capacity_kva if diesel_capacity_kva is not None else None,
+            'prime_kva': diesel_capacity_kva if diesel_capacity_kva is not None else None,
+            'standby_kw': diesel_capacity_kw * 1.1,
+            'prime_kw': diesel_capacity_kw,
+            'power_factor': diesel_power_factor,
+            'fuel_curve_lph': {0.25: 4.50, 0.50: 7.40, 0.75: 11.00, 1.0: 14.70},
+            'min_load_factor': 0.25
+        }
+        if diesel_params:
+            diesel_config.update(diesel_params)
+        self.diesel_gen = DieselGenerator(**diesel_config)
+        # Use the KiBaM battery model for current-based storage dynamics.
+        battery_config = {
+            'energy_capacity_kwh': battery_capacity_kwh,
+            'power_capacity_kw': battery_power_kw,
+            'nominal_voltage': 48.0,
+            'k_rate': 0.1,
+            'c_fraction': 0.3
+        }
+        if battery_params:
+            battery_config.update(battery_params)
+        self.battery = KiBaMBattery(**battery_config)
+
+        load_config = {
+            'base_kw': base_load_kw,
+            'timestep_minutes': timestep_minutes,
+            'load_type': load_type,
+            'base_year': self.start_date.year
+        }
+        if load_params:
+            load_config.update(load_params)
+        self.load_model = MicrogridLoad(**load_config)
 
         print(f"  + PV: {pv_capacity_kwp} kWp")
         print(f"  + Wind: {wind_capacity_kw} kW")
@@ -162,18 +198,14 @@ class MicrogridSimulation:
         return time_index
     
     def _generate_solar_data(self):
-        """Generate solar irradiance data using the Assignment 7 meteorological pipeline.
+        """Generate solar irradiance data using the internal solar resource pipeline."""
+        print("Generating solar irradiance data...")
 
-        Uses the Kigali TAG Markov model (Assignment 6) to simulate 1 year of hourly
-        irradiance data, then resamples to the timestep resolution.
-        """
-        print("Generating solar irradiance data (Assignment 7 pipeline)...")
-
-        # Kigali monthly average clearness indices (Kt) from Assignment 6
+        # Monthly average clearness indices for the default Kigali resource model.
         kigali_monthly_kt = [0.545, 0.562, 0.553, 0.56, 0.559, 0.591,
                              0.581, 0.559, 0.566, 0.545, 0.536, 0.535]
 
-        sim = SolarSimulatorKigali()
+        sim = SolarResourceSimulator()
         hourly_irradiance = np.array(sim.run_full_year(kigali_monthly_kt))
 
         # Resample to match the simulation timestep if not hourly
@@ -257,7 +289,7 @@ class MicrogridSimulation:
 
         If a load-profile CSV is provided, that profile is resampled to the
         selected timestep and repeated across the full simulation year.
-        Otherwise a synthetic load is generated from Load_model.
+        Otherwise a synthetic load profile is generated from the internal demand model.
         """
         print("Generating load profile...")
 
@@ -286,8 +318,8 @@ class MicrogridSimulation:
         """Load a provided profile and tile it across the simulation horizon.
 
         Assumption:
-        - If the CSV only contains a representative day (for example Assignment 3),
-          the day is repeated for each day of the annual simulation.
+        - If the CSV only contains a representative day, that day is repeated
+          across the simulation horizon.
         """
         profile_path = Path(self.load_profile_file)
         profile_df = pd.read_csv(profile_path)
@@ -377,7 +409,7 @@ class MicrogridSimulation:
                 print(f"  Step {step+1}/{self.total_steps} ({timestamp.date()})")
             
             # Step 1: Get resource data
-            pv_state = assignment7_pv_power(
+            pv_state = pv_power_from_ghi(
                 timestamp=timestamp,
                 ghi_w_m2=solar_irradiance[step],
                 ambient_temp_c=temperature[step],
@@ -685,12 +717,11 @@ class MicrogridSimulation:
 # ============================================================================
 
 if __name__ == "__main__":
-    # Run the required hybrid mini-grid simulation for one year
+    # Generic example configuration for a one-year hybrid microgrid run.
     # Design parameters:
     #   - Diesel generator: 60 kVA at 0.8 power factor (≈48 kW prime)
     #   - PV array: 100 kWp
     #   - Battery: 200 kWh (power 60 kW)
-    #   - Load: uses the provided assignment3_data.csv profile, repeated daily
     #   - Dispatch: load following by default; switch to 'cycle_charging' if needed
 
     print("\n" + "="*70)
@@ -709,7 +740,6 @@ if __name__ == "__main__":
         battery_power_kw=60.0,
         base_load_kw=40.0,
         load_type='residential',
-        load_profile_file='assignment3_data.csv',
         dispatch_strategy='load_following'
     )
 
