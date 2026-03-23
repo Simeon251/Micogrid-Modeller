@@ -120,6 +120,10 @@ def results_csv(results_df):
     return export_df.to_csv(index=False).encode("utf-8")
 
 
+def dataframe_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+
 st.title("Microgrid Modeler")
 st.caption("Enter datasheet values for the currently implemented microgrid resources, storage, and load assumptions, then run the simulation to get interpretable visuals and downloadable results.")
 
@@ -152,12 +156,12 @@ with st.sidebar:
     timestep_minutes = st.selectbox("Timestep (minutes)", [15, 30, 60], index=2, help="Length of each simulation step. Smaller timesteps capture faster system dynamics but take more computation.")
     num_days = st.slider("Simulation duration (days)", min_value=1, max_value=365, value=30, help="How many days the simulator will model before annualizing the results for lifecycle economics.")
     start_date = st.date_input("Start date", value=pd.Timestamp("2026-01-01"), help="Calendar date used to build the simulation time index.")
-    dispatch_strategy = st.selectbox("Dispatch strategy", ["load_following", "cycle_charging"], help="`load_following` uses diesel only when needed. `cycle_charging` runs diesel at rated output once started and uses surplus to charge the battery.")
+    dispatch_strategy = st.selectbox("Dispatch strategy", ["economic_dispatch", "load_following", "cycle_charging"], help="`economic_dispatch` chooses the lowest-cost feasible diesel/battery combination each timestep. `load_following` uses diesel only when needed. `cycle_charging` runs diesel at rated output once started and uses surplus to charge the battery.")
     random_seed = st.number_input("Random seed", min_value=0, value=42, step=1, help="Keeps synthetic weather and load generation repeatable so you can compare scenarios fairly.")
     resource_profile_file = st.text_input("Resource profile CSV path", value="", help="Optional path to a timestamped CSV containing measured or forecast resource data such as GHI, wind speed, temperature, hydro flow, and possibly load.")
     load_profile_file = st.text_input("Load profile CSV path", value="", help="Optional path to a CSV with a measured load profile. Use this when you want to replace the synthetic demand model.")
     st.info(
-        "Use `load_following` for renewable-first dispatch. Use `cycle_charging` when diesel should charge the battery whenever it starts."
+        "Use `economic_dispatch` to minimize timestep operating cost, `load_following` for renewable-first dispatch, and `cycle_charging` when diesel should charge the battery whenever it starts."
     )
     st.caption("Tip: Measured CSV data usually gives better results than the synthetic defaults.")
 
@@ -165,6 +169,7 @@ with st.sidebar:
     pv_capacity_kwp = st.number_input("Array capacity (kWp)", min_value=0.0, value=100.0, step=10.0, help="Installed DC PV array size at standard test conditions.")
     pv_temp_coeff = st.number_input("Temperature coefficient (1/C)", value=-0.00408, format="%.5f", help="Relative power loss per degree Celsius increase in cell temperature above the reference condition.")
     pv_noct = st.number_input("NOCT (C)", min_value=0.0, value=46.0, step=1.0, help="Nominal Operating Cell Temperature from the PV module datasheet.")
+    pv_isc_temp_coeff = st.number_input("Isc temperature coefficient (1/C)", value=0.0005, format="%.5f", help="Relative short-circuit current change per degree Celsius.")
     pv_losses = st.slider("System losses", min_value=0.0, max_value=0.5, value=0.15, step=0.01, help="Aggregate non-module PV losses such as wiring, mismatch, soiling, and DC collection losses.")
     pv_inverter_eff = st.slider("Inverter efficiency", min_value=0.5, max_value=1.0, value=0.96, step=0.01, help="Fraction of DC PV power converted to AC output.")
     st.caption("Enter the installed PV size and the main module/system performance assumptions from the datasheet.")
@@ -212,12 +217,16 @@ with st.sidebar:
     battery_dod = st.slider("Max depth of discharge", min_value=0.1, max_value=1.0, value=0.80, step=0.01, help="Maximum share of the battery capacity that the controller is allowed to use.")
     battery_k_rate = st.number_input("KiBaM k-rate (1/h)", min_value=0.0, value=0.1, step=0.01, format="%.2f", help="Charge transfer rate between available and bound charge reservoirs in the KiBaM battery model.")
     battery_c_fraction = st.slider("Available charge fraction", min_value=0.05, max_value=0.95, value=0.30, step=0.01, help="Fraction of total battery charge that is immediately available in the KiBaM model.")
+    battery_degradation_temp_sensitivity = st.number_input("Battery degradation temp sensitivity", min_value=0.0, value=0.025, step=0.005, format="%.3f", help="Multiplier that increases battery fade above 25 C.")
+    battery_eol_fraction = st.slider("Battery end-of-life fraction", min_value=0.50, max_value=0.95, value=0.80, step=0.01, help="Battery replacement threshold as remaining capacity fraction.")
     st.caption("If you are unsure about `k-rate` or `available charge fraction`, keep the defaults unless you have calibration data.")
 
     st.header("Load Inputs")
     base_load_kw = st.number_input("Base load (kW)", min_value=0.0, value=40.0, step=5.0, help="Average demand anchor for the synthetic load generator.")
     load_type = st.selectbox("Load type", ["residential", "commercial", "industrial"], help="Selects a built-in daily and weekly demand pattern when no measured load CSV is provided.")
     variability_std = st.slider("Load variability", min_value=0.0, max_value=0.3, value=0.08, step=0.01, help="Controls stochastic variability around the base synthetic demand pattern.")
+    price_elasticity = st.slider("Load price elasticity", min_value=-1.0, max_value=0.0, value=0.0, step=0.05, help="Negative values reduce load when tariff multipliers rise.")
+    tariff_multiplier = st.slider("Tariff multiplier", min_value=0.5, max_value=2.0, value=1.0, step=0.05, help="Relative retail tariff applied to the synthetic load model.")
     technical_loss = st.slider("Technical loss", min_value=0.0, max_value=0.3, value=0.05, step=0.01, help="Distribution and conversion losses added on top of useful load.")
     non_technical_loss = st.slider("Non-technical loss", min_value=0.0, max_value=0.3, value=0.03, step=0.01, help="Commercial or non-metered losses added on top of useful load.")
     st.caption("These fields matter only when you are using the built-in synthetic load model instead of a measured load CSV.")
@@ -228,6 +237,8 @@ with st.sidebar:
     fuel_price_per_liter = st.number_input("Fuel price ($/L)", min_value=0.0, value=1.50, step=0.05, help="Current diesel fuel price used in dispatch and lifecycle economics.")
     fuel_price_escalation_rate = st.slider("Fuel price escalation", min_value=0.0, max_value=0.2, value=0.05, step=0.01, help="Expected annual growth in fuel price over the project lifetime.")
     om_escalation_rate = st.slider("O&M escalation", min_value=0.0, max_value=0.2, value=0.03, step=0.01, help="Expected annual increase in operations and maintenance costs.")
+    energy_tariff_per_kwh = st.number_input("Energy tariff ($/kWh)", min_value=0.0, value=0.30, step=0.01, help="Average revenue tariff used for DSCR and project cash flow.")
+    tariff_escalation_rate = st.slider("Tariff escalation", min_value=0.0, max_value=0.2, value=0.03, step=0.01, help="Expected annual growth in retail tariff.")
     unserved_energy_cost_per_kwh = st.number_input("Unserved energy penalty ($/kWh)", min_value=0.0, value=2.0, step=0.1, help="Economic penalty assigned to each kWh of unmet demand.")
     st.caption("These values drive lifecycle cost and LCOE, so use assumptions that match your project finance context.")
 
@@ -244,10 +255,20 @@ with st.sidebar:
     wind_fixed_om_per_kw_year = st.number_input("Wind fixed O&M ($/kW-yr)", min_value=0.0, value=45.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of wind.")
     hydro_fixed_om_per_kw_year = st.number_input("Hydro fixed O&M ($/kW-yr)", min_value=0.0, value=35.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of hydropower.")
     diesel_fixed_om_per_kw_year = st.number_input("Diesel fixed O&M ($/kW-yr)", min_value=0.0, value=20.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of diesel capacity.")
+    diesel_maintenance_cost_per_hour = st.number_input("Diesel maintenance ($/runtime-hour)", min_value=0.0, value=1.5, step=0.1, help="Maintenance cost applied to each generator runtime hour.")
     battery_fixed_om_per_kwh_year = st.number_input("Battery fixed O&M ($/kWh-yr)", min_value=0.0, value=8.0, step=1.0, help="Annual fixed operations and maintenance cost per kWh of installed battery energy.")
     diesel_variable_om_per_kwh = st.number_input("Diesel variable O&M ($/kWh)", min_value=0.0, value=0.03, step=0.01, format="%.2f", help="Variable cost applied to each kWh produced by the diesel generator.")
     battery_variable_om_per_kwh = st.number_input("Battery variable O&M ($/kWh)", min_value=0.0, value=0.01, step=0.01, format="%.2f", help="Variable cost applied to each kWh discharged from the battery.")
     st.caption("CAPEX is paid up front. Fixed O&M is yearly. Variable O&M scales with energy produced or discharged.")
+
+    st.caption("Debt and Risk")
+    debt_fraction = st.slider("Debt fraction", min_value=0.0, max_value=0.95, value=0.70, step=0.05, help="Share of upfront CAPEX financed by debt.")
+    debt_interest_rate = st.slider("Debt interest rate", min_value=0.0, max_value=0.25, value=0.10, step=0.01, help="Nominal annual debt interest rate.")
+    debt_tenor_years = st.slider("Debt tenor (years)", min_value=1, max_value=20, value=10, help="Years over which the model repays debt.")
+    monte_carlo_runs = st.slider("Monte Carlo runs", min_value=0, max_value=1000, value=200, step=50, help="Number of stochastic finance scenarios used for risk outputs.")
+    fuel_price_volatility = st.slider("Fuel price volatility", min_value=0.0, max_value=0.6, value=0.18, step=0.01, help="Annualized fuel price volatility used in the GBM process.")
+    inflation_volatility = st.slider("Inflation volatility", min_value=0.0, max_value=0.2, value=0.02, step=0.005, help="Shock size for annual CPI in the AR(1) process.")
+    exchange_rate_volatility = st.slider("FX volatility", min_value=0.0, max_value=0.4, value=0.08, step=0.01, help="Shock size for annual FX in the AR(1) process.")
 
     st.header("Visual Range")
     days_to_plot = st.slider("Days to show in time-series plots", min_value=1, max_value=max(1, num_days), value=min(14, num_days), help="How much of the simulated period to show in the time-series charts.")
@@ -280,6 +301,7 @@ if run_simulation:
                 "noct": pv_noct,
                 "system_losses": pv_losses,
                 "inverter_efficiency": pv_inverter_eff,
+                "isc_temp_coeff_rel": pv_isc_temp_coeff,
             },
             wind_params={
                 "rated_power_kw": wind_capacity_kw,
@@ -314,9 +336,13 @@ if run_simulation:
                 "max_depth_of_discharge": battery_dod,
                 "k_rate": battery_k_rate,
                 "c_fraction": battery_c_fraction,
+                "degradation_temp_sensitivity": battery_degradation_temp_sensitivity,
+                "end_of_life_capacity_fraction": battery_eol_fraction,
             },
             load_params={
                 "variability_std": variability_std,
+                "price_elasticity": price_elasticity,
+                "tariff_multiplier": tariff_multiplier,
                 "technical_loss": technical_loss,
                 "non_technical_loss": non_technical_loss,
             },
@@ -326,6 +352,8 @@ if run_simulation:
                 "fuel_price_per_liter": fuel_price_per_liter,
                 "fuel_price_escalation_rate": fuel_price_escalation_rate,
                 "om_escalation_rate": om_escalation_rate,
+                "energy_tariff_per_kwh": energy_tariff_per_kwh,
+                "tariff_escalation_rate": tariff_escalation_rate,
                 "unserved_energy_cost_per_kwh": unserved_energy_cost_per_kwh,
                 "pv_capex_per_kwp": pv_capex_per_kwp,
                 "wind_capex_per_kw": wind_capex_per_kw,
@@ -337,14 +365,24 @@ if run_simulation:
                 "wind_fixed_om_per_kw_year": wind_fixed_om_per_kw_year,
                 "hydro_fixed_om_per_kw_year": hydro_fixed_om_per_kw_year,
                 "diesel_fixed_om_per_kw_year": diesel_fixed_om_per_kw_year,
+                "diesel_maintenance_cost_per_hour": diesel_maintenance_cost_per_hour,
                 "battery_fixed_om_per_kwh_year": battery_fixed_om_per_kwh_year,
                 "diesel_variable_om_per_kwh": diesel_variable_om_per_kwh,
                 "battery_variable_om_per_kwh": battery_variable_om_per_kwh,
+                "debt_fraction": debt_fraction,
+                "debt_interest_rate": debt_interest_rate,
+                "debt_tenor_years": debt_tenor_years,
+                "monte_carlo_runs": monte_carlo_runs,
+                "fuel_price_volatility": fuel_price_volatility,
+                "inflation_volatility": inflation_volatility,
+                "exchange_rate_volatility": exchange_rate_volatility,
             },
         )
         results_df = sim.run_simulation(save_results=False, verbose=False)
         metrics = sim.performance_metrics
         cashflow_df = sim.economic_cashflow
+        monte_carlo_df = sim.monte_carlo_summary
+        monte_carlo_samples_df = sim.monte_carlo_samples
 
     st.success("Simulation complete.")
 
@@ -366,7 +404,13 @@ if run_simulation:
     col11.metric("Operating Cost/kWh", f"${metrics['operating_cost_per_kwh_served']:.3f}/kWh")
     col12.metric("Battery Replace Interval", f"{metrics['battery_replacement_interval_years']:.1f} yr")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Visuals", "Results Table", "Economics", "Downloads"])
+    col13, col14, col15, col16 = st.columns(4)
+    col13.metric("Min DSCR", f"{metrics['minimum_dscr']:.2f}" if pd.notna(metrics["minimum_dscr"]) else "N/A")
+    col14.metric("Avg DSCR", f"{metrics['average_dscr']:.2f}" if pd.notna(metrics["average_dscr"]) else "N/A")
+    col15.metric("LCOE P50", f"${metrics['lcoe_p50']:.3f}/kWh" if pd.notna(metrics["lcoe_p50"]) else "N/A")
+    col16.metric("LCOE P90", f"${metrics['lcoe_p90']:.3f}/kWh" if pd.notna(metrics["lcoe_p90"]) else "N/A")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Visuals", "Results Table", "Economics", "Risk", "Downloads"])
 
     with tab1:
         left, right = st.columns([2, 1])
@@ -390,6 +434,7 @@ if run_simulation:
                             "Total wind generation (kWh)",
                             "Total hydro generation (kWh)",
                             "Total diesel generation (kWh)",
+                            "Direct renewable fraction",
                             "Unmet load fraction",
                             "Loss of load probability",
                             "Peak load (kW)",
@@ -399,6 +444,7 @@ if run_simulation:
                             round(metrics["total_wind_generation_kwh"], 2),
                             round(metrics["total_hydro_generation_kwh"], 2),
                             round(metrics["total_diesel_generation_kwh"], 2),
+                            round(metrics["direct_renewable_fraction"], 4),
                             round(metrics["unmet_load_fraction"], 4),
                             round(metrics["loss_of_load_probability"], 4),
                             round(metrics["peak_load_kw"], 2),
@@ -422,21 +468,33 @@ if run_simulation:
                             "Upfront CAPEX",
                             "Lifecycle cost (NPV)",
                             "LCOE",
+                            "Renewable fraction",
+                            "Direct renewable fraction",
+                            "Renewable via battery (kWh)",
                             "Operating cost per kWh",
                             "Discounted operating cost",
                             "Discounted unserved energy cost",
                             "Discounted salvage value",
                             "Annual fixed O&M (base year)",
+                            "Annual debt service",
+                            "Minimum DSCR",
+                            "Average DSCR",
                         ],
                         "Value": [
                             round(metrics["upfront_capex"], 2),
                             round(metrics["discounted_lifecycle_cost"], 2),
                             round(metrics["lcoe"], 4),
+                            round(metrics["renewable_fraction"], 4),
+                            round(metrics["direct_renewable_fraction"], 4),
+                            round(metrics["total_renewable_from_battery_served_kwh"], 2),
                             round(metrics["operating_cost_per_kwh_served"], 4),
                             round(metrics["discounted_operating_cost"], 2),
                             round(metrics["discounted_unserved_energy_cost"], 2),
                             round(metrics["discounted_salvage_value"], 2),
                             round(metrics["annual_fixed_om_base"], 2),
+                            round(metrics["annual_debt_service"], 2),
+                            round(metrics["minimum_dscr"], 3) if pd.notna(metrics["minimum_dscr"]) else None,
+                            round(metrics["average_dscr"], 3) if pd.notna(metrics["average_dscr"]) else None,
                         ],
                     }
                 ),
@@ -447,6 +505,11 @@ if run_simulation:
             st.dataframe(cashflow_df, use_container_width=True, hide_index=True)
 
     with tab4:
+        st.dataframe(monte_carlo_df, use_container_width=True, hide_index=True)
+        if not monte_carlo_samples_df.empty:
+            st.dataframe(monte_carlo_samples_df, use_container_width=True, hide_index=True)
+
+    with tab5:
         st.download_button(
             "Download results CSV",
             data=results_csv(results_df),
@@ -465,6 +528,20 @@ if run_simulation:
             file_name="microgrid_cashflow.csv",
             mime="text/csv",
         )
+        if not monte_carlo_df.empty:
+            st.download_button(
+                "Download Monte Carlo summary CSV",
+                data=dataframe_csv(monte_carlo_df),
+                file_name="microgrid_monte_carlo_summary.csv",
+                mime="text/csv",
+            )
+        if not monte_carlo_samples_df.empty:
+            st.download_button(
+                "Download Monte Carlo samples CSV",
+                data=dataframe_csv(monte_carlo_samples_df),
+                file_name="microgrid_monte_carlo_samples.csv",
+                mime="text/csv",
+            )
 
 else:
     st.info("Set the component datasheet values in the sidebar, then click Run Simulation.")

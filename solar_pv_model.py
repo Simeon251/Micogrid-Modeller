@@ -24,6 +24,7 @@ MODULE_VOC_STC = 45.68
 MODULE_ISC_STC = 9.06
 MODULE_FF_STC = (MODULE_VMPP_STC * MODULE_IMPP_STC) / (MODULE_VOC_STC * MODULE_ISC_STC)
 VOC_TEMP_COEFF_REL = -0.00311
+ISC_TEMP_COEFF_REL = 0.0005
 # Not listed directly in the datasheet, so this remains an explicit assumption.
 FF_TEMP_COEFF_REL = -0.0005
 
@@ -161,7 +162,7 @@ def pv_power_efficiency_model(Gt, Tc):
 
 
 # --- Fill-factor PV model ---
-def pv_power_fillfactor(Gt, Tc):
+def pv_power_fillfactor(Gt, Tc, isc_temp_coeff_rel=ISC_TEMP_COEFF_REL):
     """Fill-factor based PV model.
 
     Module values come from the CHSM6612P-320 datasheet:
@@ -184,7 +185,7 @@ def pv_power_fillfactor(Gt, Tc):
     # irradiance ratio (STC=1000 W/m2)
     irr_ratio = max(Gt / 1000.0, 0.0)
 
-    Isc = MODULE_ISC_STC * irr_ratio
+    Isc = MODULE_ISC_STC * irr_ratio * (1 + isc_temp_coeff_rel * (Tc - 25.0))
     Voc = MODULE_VOC_STC * (1 + VOC_TEMP_COEFF_REL * (Tc - 25.0))
     FF = MODULE_FF_STC * (1 + FF_TEMP_COEFF_REL * (Tc - 25.0))
     FF = max(0.0, FF)
@@ -194,7 +195,7 @@ def pv_power_fillfactor(Gt, Tc):
     return max(P_array, 0.0)
 
 
-def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_SIZE):
+def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_SIZE, isc_temp_coeff_rel=ISC_TEMP_COEFF_REL):
     """PV performance pipeline for one timestamp.
 
     Starting from horizontal irradiance, this applies:
@@ -220,7 +221,11 @@ def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_
     previous_system_size = SYSTEM_SIZE
     SYSTEM_SIZE = system_size_w
     try:
-        pv_power_w = pv_power_fillfactor(tilted_irradiance, cell_temp_c)
+        pv_power_w = pv_power_fillfactor(
+            tilted_irradiance,
+            cell_temp_c,
+            isc_temp_coeff_rel=isc_temp_coeff_rel
+        )
     finally:
         SYSTEM_SIZE = previous_system_size
 
@@ -238,6 +243,7 @@ def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_
         "module_count": module_count,
         "module_stc_w": module_stc_w,
         "module_ff_stc": MODULE_FF_STC,
+        "module_isc_temp_coeff_rel": isc_temp_coeff_rel,
     }
 
 def run_pv_simulation_from_power_file(

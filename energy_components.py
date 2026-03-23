@@ -120,6 +120,18 @@ class DieselGenerator:
             self.runtime_hours += timestep_hr
         return fuel_used
 
+    def estimate_fuel_consumption(self, power_kw, timestep_hr=1.0):
+        """Estimate fuel use without mutating runtime state."""
+        if power_kw < 0:
+            raise ValueError("Negative power not allowed")
+        if power_kw > self.rated_kw:
+            raise ValueError("Power exceeds generator capacity")
+        if power_kw > 0 and power_kw < self.min_load_factor * self.rated_kw:
+            power_kw = self.min_load_factor * self.rated_kw
+
+        fuel_rate = self.fuel_slope * power_kw + self.fuel_intercept
+        return max(0.0, fuel_rate) * timestep_hr
+
     def is_end_of_life(self):
         return self.runtime_hours >= self.end_of_life_hours
 

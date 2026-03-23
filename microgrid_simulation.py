@@ -18,7 +18,7 @@ from datetime import timedelta
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from solar_pv_model import pv_power_from_ghi
+from solar_pv_model import pv_power_from_ghi, extraterrestrial_hour
 from battery_module import KiBaMBattery
 from demand_model import MicrogridLoad
 from dispatch_model import load_following_algorithm
@@ -130,10 +130,21 @@ class MicrogridSimulation:
         if diesel_capacity_kva is not None:
             diesel_capacity_kw = diesel_capacity_kva * diesel_power_factor
 
+        pv_model_overrides = {}
+        if pv_params:
+            pv_model_overrides = {
+                key: pv_params[key]
+                for key in ['isc_temp_coeff_rel']
+                if key in pv_params
+            }
+
         pv_config = {'array_capacity_kwp': pv_capacity_kwp}
         if pv_params:
-            pv_config.update(pv_params)
+            pv_config.update({k: v for k, v in pv_params.items() if k not in pv_model_overrides})
         self.pv_gen = PVGenerator(**pv_config)
+        self.pv_model_params = {
+            'isc_temp_coeff_rel': pv_model_overrides.get('isc_temp_coeff_rel', 0.0005)
+        }
 
         wind_config = {'rated_power_kw': wind_capacity_kw}
         if wind_params:
@@ -206,6 +217,9 @@ class MicrogridSimulation:
         self.system_states = []
         self.performance_metrics = {}
         self.economic_cashflow = pd.DataFrame()
+        self.monte_carlo_summary = pd.DataFrame()
+        self.monte_carlo_samples = pd.DataFrame()
+        self.battery_renewable_energy_kwh = 0.0
 
     def _build_economic_params(self, overrides=None):
         """Build lifecycle economics assumptions with user overrides."""
@@ -214,8 +228,16 @@ class MicrogridSimulation:
             'project_lifetime_years': 20,
             'nominal_discount_rate': 0.12,
             'general_inflation_rate': 0.03,
+            'inflation_volatility': 0.02,
+            'inflation_ar1': 0.45,
+            'base_exchange_rate': 1.0,
+            'exchange_rate_volatility': 0.08,
+            'exchange_rate_ar1': 0.35,
             'fuel_price_per_liter': 1.50,
             'fuel_price_escalation_rate': 0.05,
+            'fuel_price_volatility': 0.18,
+            'energy_tariff_per_kwh': 0.30,
+            'tariff_escalation_rate': 0.03,
             'pv_capex_per_kwp': 900.0,
             'wind_capex_per_kw': 1500.0,
             'hydro_capex_per_kw': 2500.0,
@@ -226,6 +248,7 @@ class MicrogridSimulation:
             'wind_fixed_om_per_kw_year': 45.0,
             'hydro_fixed_om_per_kw_year': 35.0,
             'diesel_fixed_om_per_kw_year': 20.0,
+            'diesel_maintenance_cost_per_hour': 1.50,
             'battery_fixed_om_per_kwh_year': 8.0,
             'battery_variable_om_per_kwh': 0.01,
             'diesel_variable_om_per_kwh': 0.03,
@@ -243,6 +266,10 @@ class MicrogridSimulation:
             'hydro_replacement_cost_fraction': 0.90,
             'inverter_replacement_cost_fraction': 0.12,
             'include_salvage_value': True,
+            'debt_fraction': 0.70,
+            'debt_interest_rate': 0.10,
+            'debt_tenor_years': 10,
+            'monte_carlo_runs': 200,
         }
         if overrides:
             defaults.update(overrides)
@@ -261,16 +288,72 @@ class MicrogridSimulation:
         """Escalate a base-year nominal cost into future year nominal terms."""
         return base_cost * ((1.0 + escalation_rate) ** max(year_index - 1, 0))
 
-    def _estimate_battery_replacement_interval_years(self, annual_battery_throughput_kwh):
-        """Estimate battery life from calendar and throughput constraints."""
-        calendar_life = max(self.battery.lifetime_years, 1.0)
+    def _estimate_battery_replacement_interval_years(self, annual_battery_throughput_kwh, annual_avg_battery_temp_c=25.0):
+        """Estimate battery replacement interval from fade-to-EOL instead of simple cycle count."""
+        nominal_capacity = max(self.battery.nominal_capacity_kwh, 1e-6)
+        eol_fraction = getattr(self.battery, 'end_of_life_capacity_fraction', 0.80)
+        fade_margin = max(1.0 - eol_fraction, 1e-6)
+        temp_multiplier = self.battery._temperature_fade_multiplier(annual_avg_battery_temp_c)
+
+        annual_calendar_fade = min(
+            fade_margin,
+            365.0 * self.battery.calendar_fade_rate * temp_multiplier
+        )
+        annual_cycle_fade = annual_battery_throughput_kwh * self.battery.cycle_fade_per_kwh * temp_multiplier
+
         throughput_limit_mwh = getattr(self.battery, 'lifetime_throughput_MWh', None)
+        throughput_life = np.inf
         if throughput_limit_mwh is not None and annual_battery_throughput_kwh > 0:
             throughput_life = (throughput_limit_mwh * 1000.0) / annual_battery_throughput_kwh
-            calendar_life = min(calendar_life, max(throughput_life, 1.0))
-        return max(calendar_life, 1.0)
 
-    def _build_lifecycle_cashflow(self, annual_metrics):
+        annual_total_fade = annual_calendar_fade + annual_cycle_fade
+        fade_life = np.inf if annual_total_fade <= 0 else fade_margin / annual_total_fade
+        calendar_life = max(self.battery.lifetime_years, 1.0)
+        return max(1.0, min(calendar_life, fade_life, throughput_life))
+
+    def _annual_debt_service(self, principal, interest_rate, tenor_years):
+        """Level annual debt service for a simple annuity loan."""
+        if principal <= 0 or tenor_years <= 0:
+            return 0.0
+        if interest_rate <= 0:
+            return principal / tenor_years
+        growth = (1.0 + interest_rate) ** tenor_years
+        return principal * interest_rate * growth / max(growth - 1.0, 1e-9)
+
+    def _generate_stochastic_financial_paths(self, project_life, rng):
+        """Generate annual stochastic fuel, inflation, and FX paths."""
+        econ = self.economic_params
+        fuel_prices = np.zeros(project_life + 1)
+        cpi_index = np.ones(project_life + 1)
+        fx_index = np.ones(project_life + 1)
+
+        fuel_prices[0] = econ['fuel_price_per_liter']
+        inflation_mean = econ['general_inflation_rate']
+        inflation_phi = econ['inflation_ar1']
+        inflation_dev = 0.0
+
+        fx_phi = econ['exchange_rate_ar1']
+        log_fx_dev = 0.0
+
+        for year in range(1, project_life + 1):
+            fuel_drift = np.log1p(econ['fuel_price_escalation_rate'])
+            fuel_shock = econ['fuel_price_volatility'] * rng.normal()
+            fuel_prices[year] = fuel_prices[year - 1] * np.exp(fuel_drift - 0.5 * econ['fuel_price_volatility'] ** 2 + fuel_shock)
+
+            inflation_dev = inflation_phi * inflation_dev + econ['inflation_volatility'] * rng.normal()
+            inflation_rate = max(-0.90, inflation_mean + inflation_dev)
+            cpi_index[year] = cpi_index[year - 1] * (1.0 + inflation_rate)
+
+            log_fx_dev = fx_phi * log_fx_dev + econ['exchange_rate_volatility'] * rng.normal()
+            fx_index[year] = np.exp(log_fx_dev)
+
+        return {
+            'fuel_price_per_liter': fuel_prices,
+            'cpi_index': cpi_index,
+            'fx_index': fx_index,
+        }
+
+    def _build_lifecycle_cashflow(self, annual_metrics, stochastic_paths=None):
         """Construct discounted lifecycle economics from annualized simulation outputs."""
         econ = self.economic_params
         project_life = int(max(1, econ['project_lifetime_years']))
@@ -295,12 +378,20 @@ class MicrogridSimulation:
         )
 
         annual_battery_throughput_kwh = annual_metrics['total_battery_throughput_kwh']
+        annual_avg_battery_temp_c = annual_metrics.get('average_battery_temperature_c', 25.0)
         battery_replacement_interval = self._estimate_battery_replacement_interval_years(
-            annual_battery_throughput_kwh
+            annual_battery_throughput_kwh,
+            annual_avg_battery_temp_c
         )
 
         annual_runtime = annual_metrics['diesel_runtime_hours']
         diesel_runtime_limit = max(self.diesel_gen.end_of_life_hours, 1.0)
+        debt_principal = upfront_capex * econ['debt_fraction']
+        annual_debt_service = self._annual_debt_service(
+            debt_principal,
+            econ['debt_interest_rate'],
+            int(max(econ['debt_tenor_years'], 0))
+        )
 
         cashflows = []
         discounted_energy_served = 0.0
@@ -324,10 +415,15 @@ class MicrogridSimulation:
                     'fixed_om_cost': 0.0,
                     'fuel_cost': 0.0,
                     'diesel_variable_om_cost': 0.0,
+                    'diesel_maintenance_cost': 0.0,
                     'battery_variable_om_cost': 0.0,
                     'unserved_energy_cost': 0.0,
                     'replacement_cost': 0.0,
                     'salvage_value': 0.0,
+                    'revenue': 0.0,
+                    'cfads': 0.0,
+                    'debt_service': 0.0,
+                    'dscr': np.nan,
                     'capital_cost': upfront_capex,
                     'total_cost': upfront_capex,
                     'discounted_total_cost': upfront_capex,
@@ -335,82 +431,51 @@ class MicrogridSimulation:
                 })
                 continue
 
-            fuel_cost = self._escalated_cost(
-                annual_metrics['total_fuel_liters'] * econ['fuel_price_per_liter'],
-                econ['fuel_price_escalation_rate'],
-                year
-            )
-            fixed_om_cost = self._escalated_cost(
-                annual_fixed_om_base,
-                econ['om_escalation_rate'],
-                year
-            )
-            diesel_variable_om_cost = self._escalated_cost(
-                annual_metrics['total_diesel_generation_kwh'] * econ['diesel_variable_om_per_kwh'],
-                econ['om_escalation_rate'],
-                year
-            )
-            battery_variable_om_cost = self._escalated_cost(
-                annual_metrics['total_battery_throughput_kwh'] * econ['battery_variable_om_per_kwh'],
-                econ['om_escalation_rate'],
-                year
-            )
-            unserved_energy_cost = self._escalated_cost(
-                annual_metrics['total_load_shedding_kwh'] * econ['unserved_energy_cost_per_kwh'],
-                econ['om_escalation_rate'],
-                year
-            )
+            if stochastic_paths is None:
+                fuel_price = econ['fuel_price_per_liter'] * ((1.0 + econ['fuel_price_escalation_rate']) ** max(year - 1, 0))
+                om_multiplier = (1.0 + econ['om_escalation_rate']) ** max(year - 1, 0)
+                tariff = econ['energy_tariff_per_kwh'] * ((1.0 + econ['tariff_escalation_rate']) ** max(year - 1, 0))
+                fx_multiplier = (1.0 + econ['general_inflation_rate']) ** max(year - 1, 0)
+            else:
+                fuel_price = float(stochastic_paths['fuel_price_per_liter'][year])
+                om_multiplier = float(stochastic_paths['cpi_index'][year])
+                tariff = econ['energy_tariff_per_kwh'] * float(stochastic_paths['cpi_index'][year])
+                fx_multiplier = float(stochastic_paths['fx_index'][year])
+
+            fuel_cost = annual_metrics['total_fuel_liters'] * fuel_price
+            fixed_om_cost = annual_fixed_om_base * om_multiplier
+            diesel_variable_om_cost = annual_metrics['total_diesel_generation_kwh'] * econ['diesel_variable_om_per_kwh'] * om_multiplier
+            diesel_maintenance_cost = annual_runtime * econ['diesel_maintenance_cost_per_hour'] * om_multiplier
+            battery_variable_om_cost = annual_metrics['total_battery_throughput_kwh'] * econ['battery_variable_om_per_kwh'] * om_multiplier
+            unserved_energy_cost = annual_metrics['total_load_shedding_kwh'] * econ['unserved_energy_cost_per_kwh'] * om_multiplier
+            revenue = annual_metrics['total_load_served_kwh'] * tariff
 
             replacement_cost = 0.0
             cumulative_runtime += annual_runtime
 
             if annual_runtime > 0 and cumulative_runtime >= diesel_runtime_limit:
-                replacement_cost += self._escalated_cost(
-                    diesel_capex * econ['diesel_replacement_cost_fraction'],
-                    econ['diesel_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += diesel_capex * econ['diesel_replacement_cost_fraction'] * fx_multiplier
                 cumulative_runtime = max(0.0, cumulative_runtime - diesel_runtime_limit)
                 last_diesel_install_year = year
 
             if year - last_battery_install_year >= battery_replacement_interval:
-                replacement_cost += self._escalated_cost(
-                    battery_capex * econ['battery_replacement_cost_fraction'],
-                    econ['battery_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += battery_capex * econ['battery_replacement_cost_fraction'] * fx_multiplier
                 last_battery_install_year = year
 
             if year - last_pv_install_year >= self.pv_gen.lifetime_years:
-                replacement_cost += self._escalated_cost(
-                    pv_capex * econ['pv_replacement_cost_fraction'],
-                    econ['pv_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += pv_capex * econ['pv_replacement_cost_fraction'] * fx_multiplier
                 last_pv_install_year = year
 
             if year - last_wind_install_year >= self.wind_turbine.lifetime_years:
-                replacement_cost += self._escalated_cost(
-                    wind_capex * econ['wind_replacement_cost_fraction'],
-                    econ['wind_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += wind_capex * econ['wind_replacement_cost_fraction'] * fx_multiplier
                 last_wind_install_year = year
 
             if year - last_hydro_install_year >= self.hydro_turbine.lifetime_years:
-                replacement_cost += self._escalated_cost(
-                    hydro_capex * econ['hydro_replacement_cost_fraction'],
-                    econ['hydro_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += hydro_capex * econ['hydro_replacement_cost_fraction'] * fx_multiplier
                 last_hydro_install_year = year
 
             if self.pv_gen.inverter_lifetime > 0 and year % self.pv_gen.inverter_lifetime == 0:
-                replacement_cost += self._escalated_cost(
-                    pv_capex * econ['inverter_replacement_cost_fraction'],
-                    econ['pv_capex_escalation_rate'],
-                    year
-                )
+                replacement_cost += pv_capex * econ['inverter_replacement_cost_fraction'] * fx_multiplier
 
             salvage_value = 0.0
             if econ['include_salvage_value'] and year == project_life:
@@ -435,18 +500,22 @@ class MicrogridSimulation:
                 )
 
                 salvage_value = (
-                    self._escalated_cost(battery_capex, econ['battery_capex_escalation_rate'], project_life) * battery_remaining_fraction +
-                    self._escalated_cost(diesel_capex, econ['diesel_capex_escalation_rate'], project_life) * diesel_remaining_fraction +
-                    self._escalated_cost(pv_capex, econ['pv_capex_escalation_rate'], project_life) * pv_remaining_fraction +
-                    self._escalated_cost(wind_capex, econ['wind_capex_escalation_rate'], project_life) * wind_remaining_fraction +
-                    self._escalated_cost(hydro_capex, econ['hydro_capex_escalation_rate'], project_life) * hydro_remaining_fraction
+                    battery_capex * fx_multiplier * battery_remaining_fraction +
+                    diesel_capex * fx_multiplier * diesel_remaining_fraction +
+                    pv_capex * fx_multiplier * pv_remaining_fraction +
+                    wind_capex * fx_multiplier * wind_remaining_fraction +
+                    hydro_capex * fx_multiplier * hydro_remaining_fraction
                 )
 
             annual_total_cost = (
                 fixed_om_cost + fuel_cost + diesel_variable_om_cost +
-                battery_variable_om_cost + unserved_energy_cost + replacement_cost -
+                diesel_maintenance_cost + battery_variable_om_cost +
+                unserved_energy_cost + replacement_cost -
                 salvage_value
             )
+            cfads = revenue - annual_total_cost
+            debt_service = annual_debt_service if year <= econ['debt_tenor_years'] else 0.0
+            dscr = np.nan if debt_service <= 0 else cfads / debt_service
 
             discount_factor = self._discount_factor(year)
             discounted_total = annual_total_cost / discount_factor
@@ -454,7 +523,8 @@ class MicrogridSimulation:
 
             discounted_cost_total += discounted_total
             discounted_operating_cost += (
-                fixed_om_cost + fuel_cost + diesel_variable_om_cost + battery_variable_om_cost
+                fixed_om_cost + fuel_cost + diesel_variable_om_cost +
+                diesel_maintenance_cost + battery_variable_om_cost
             ) / discount_factor
             discounted_unserved_cost += unserved_energy_cost / discount_factor
             discounted_salvage += salvage_value / discount_factor
@@ -466,10 +536,15 @@ class MicrogridSimulation:
                 'fixed_om_cost': fixed_om_cost,
                 'fuel_cost': fuel_cost,
                 'diesel_variable_om_cost': diesel_variable_om_cost,
+                'diesel_maintenance_cost': diesel_maintenance_cost,
                 'battery_variable_om_cost': battery_variable_om_cost,
                 'unserved_energy_cost': unserved_energy_cost,
                 'replacement_cost': replacement_cost,
                 'salvage_value': salvage_value,
+                'revenue': revenue,
+                'cfads': cfads,
+                'debt_service': debt_service,
+                'dscr': dscr,
                 'capital_cost': 0.0,
                 'total_cost': annual_total_cost,
                 'discounted_total_cost': discounted_total,
@@ -478,6 +553,7 @@ class MicrogridSimulation:
 
         cashflow_df = pd.DataFrame(cashflows)
         lcoe = discounted_cost_total / max(discounted_energy_served, 1e-6)
+        dscr_series = cashflow_df.loc[cashflow_df['debt_service'] > 0, 'dscr']
         return cashflow_df, {
             'upfront_capex': upfront_capex,
             'discounted_lifecycle_cost': discounted_cost_total,
@@ -489,7 +565,42 @@ class MicrogridSimulation:
             'project_lifetime_years': project_life,
             'annual_fixed_om_base': annual_fixed_om_base,
             'battery_replacement_interval_years': battery_replacement_interval,
+            'debt_principal': debt_principal,
+            'annual_debt_service': annual_debt_service,
+            'average_dscr': float(dscr_series.mean()) if not dscr_series.empty else np.nan,
+            'minimum_dscr': float(dscr_series.min()) if not dscr_series.empty else np.nan,
         }
+
+    def _run_monte_carlo_financial_risk(self, annual_metrics):
+        """Run Monte Carlo on annual economics using stochastic fuel, CPI, and FX paths."""
+        project_life = int(max(1, self.economic_params['project_lifetime_years']))
+        n_runs = int(max(0, self.economic_params.get('monte_carlo_runs', 0)))
+        if n_runs <= 0:
+            return pd.DataFrame(), pd.DataFrame()
+
+        rng = np.random.default_rng(self.random_seed)
+        samples = []
+        for run in range(n_runs):
+            stochastic_paths = self._generate_stochastic_financial_paths(project_life, rng)
+            _, lifecycle_metrics = self._build_lifecycle_cashflow(
+                annual_metrics,
+                stochastic_paths=stochastic_paths
+            )
+            samples.append({
+                'run': run + 1,
+                'discounted_lifecycle_cost': lifecycle_metrics['discounted_lifecycle_cost'],
+                'lcoe': lifecycle_metrics['lcoe'],
+                'minimum_dscr': lifecycle_metrics['minimum_dscr'],
+                'average_dscr': lifecycle_metrics['average_dscr'],
+            })
+
+        samples_df = pd.DataFrame(samples)
+        summary_df = pd.DataFrame([
+            {'metric': 'discounted_lifecycle_cost', 'mean': samples_df['discounted_lifecycle_cost'].mean(), 'p10': samples_df['discounted_lifecycle_cost'].quantile(0.10), 'p50': samples_df['discounted_lifecycle_cost'].quantile(0.50), 'p90': samples_df['discounted_lifecycle_cost'].quantile(0.90), 'std': samples_df['discounted_lifecycle_cost'].std(ddof=0)},
+            {'metric': 'lcoe', 'mean': samples_df['lcoe'].mean(), 'p10': samples_df['lcoe'].quantile(0.10), 'p50': samples_df['lcoe'].quantile(0.50), 'p90': samples_df['lcoe'].quantile(0.90), 'std': samples_df['lcoe'].std(ddof=0)},
+            {'metric': 'minimum_dscr', 'mean': samples_df['minimum_dscr'].mean(), 'p10': samples_df['minimum_dscr'].quantile(0.10), 'p50': samples_df['minimum_dscr'].quantile(0.50), 'p90': samples_df['minimum_dscr'].quantile(0.90), 'std': samples_df['minimum_dscr'].std(ddof=0)},
+        ])
+        return samples_df, summary_df
         
     def _create_time_index(self):
         """Create time index for simulation with specified timestep resolution."""
@@ -616,6 +727,48 @@ class MicrogridSimulation:
         print(f"  + Wind speed mean: {np.mean(wind_speed):.1f} m/s")
         print(f"  + Wind speed max: {np.max(wind_speed):.1f} m/s")
         return wind_speed
+
+    def _dumortier_hourly_temperature(self, daily_tmin, daily_tmax):
+        """Construct hourly temperatures from daily Tmin/Tmax using an irradiance-ratio shape."""
+        temperature = np.zeros(len(self.time_index))
+
+        for day_idx, day in enumerate(pd.Index(self.time_index.normalize().unique())):
+            day_mask = self.time_index.normalize() == day
+            day_positions = np.flatnonzero(day_mask)
+            if len(day_positions) == 0:
+                continue
+
+            tmin = daily_tmin[min(day_idx, len(daily_tmin) - 1)]
+            tmax = daily_tmax[min(day_idx, len(daily_tmax) - 1)]
+
+            g0h = []
+            for pos in day_positions:
+                timestamp = self.time_index[pos]
+                hour = timestamp.hour + timestamp.minute / 60.0
+                extraterrestrial, _, _ = extraterrestrial_hour(timestamp.dayofyear, hour)
+                g0h.append(max(extraterrestrial, 0.0))
+
+            g0h = np.array(g0h, dtype=float)
+            daylight_total = g0h[g0h > 0].sum()
+            if daylight_total > 0:
+                kx = np.where(g0h > 0, g0h / daylight_total, 0.0)
+                daylight_mask = g0h > 0
+                daylight_scale = kx[daylight_mask] / max(kx[daylight_mask].max(), 1e-9)
+                day_values = np.full(len(day_positions), tmin, dtype=float)
+                day_values[daylight_mask] = tmin + (tmax - tmin) * daylight_scale
+            else:
+                day_values = np.full(len(day_positions), tmin, dtype=float)
+
+            night_mask = g0h <= 0
+            if np.any(night_mask):
+                night_indices = np.flatnonzero(night_mask)
+                for idx in night_indices:
+                    frac = idx / max(len(day_positions) - 1, 1)
+                    day_values[idx] = tmin + 0.15 * (tmax - tmin) * (1.0 - frac)
+
+            temperature[day_positions] = day_values
+
+        return temperature
     
     def _generate_temperature_data(self, resource_df=None):
         """
@@ -636,17 +789,32 @@ class MicrogridSimulation:
                 print(f"  + Temperature mean: {np.mean(temperature):.1f} C")
                 print(f"  + Temperature range: [{np.min(temperature):.1f}, {np.max(temperature):.1f}] C")
                 return temperature
-        
-        day_of_year = np.array([d.dayofyear for d in self.time_index])
-        hour_of_day = np.array([d.hour for d in self.time_index])
-        
-        # Seasonal temperature variation (sine wave, cold in winter, hot in summer)
-        seasonal = 15 + 15 * np.sin((day_of_year - 80) * 2 * np.pi / 365)
-        
-        # Daily temperature variation (colder at night, warmer during day)
-        daily = 8 * np.sin((hour_of_day - 6) * np.pi / 12)
-        
-        temperature = seasonal + daily + np.random.normal(0, 2, len(self.time_index))
+
+            tmin_col = self._find_column(resource_df, ['tmin_c', 'temperature_min_c', 'daily_tmin_c'])
+            tmax_col = self._find_column(resource_df, ['tmax_c', 'temperature_max_c', 'daily_tmax_c'])
+            if tmin_col is not None and tmax_col is not None:
+                daily_temp = resource_df[[tmin_col, tmax_col]].copy()
+                daily_temp['day'] = self.time_index.normalize()
+                daily_grouped = daily_temp.groupby('day').mean(numeric_only=True)
+                temperature = self._dumortier_hourly_temperature(
+                    daily_grouped[tmin_col].to_numpy(),
+                    daily_grouped[tmax_col].to_numpy()
+                )
+                print(f"  + Temperature reconstructed from daily Tmin/Tmax using irradiance-ratio profile")
+                print(f"  + Temperature mean: {np.mean(temperature):.1f} C")
+                print(f"  + Temperature range: [{np.min(temperature):.1f}, {np.max(temperature):.1f}] C")
+                return temperature
+
+        days = pd.Index(self.time_index.normalize().unique())
+        day_of_year = np.array([day.dayofyear for day in days])
+
+        # Synthetic daily extrema before hourly reconstruction.
+        daily_tmin = 12 + 6 * np.sin((day_of_year - 110) * 2 * np.pi / 365) + np.random.normal(0, 1.0, len(days))
+        daily_tmax = daily_tmin + 8 + 3 * np.sin((day_of_year - 80) * 2 * np.pi / 365) + np.random.normal(0, 1.0, len(days))
+        daily_tmax = np.maximum(daily_tmax, daily_tmin + 1.0)
+
+        temperature = self._dumortier_hourly_temperature(daily_tmin, daily_tmax)
+        temperature += np.random.normal(0, 0.5, len(self.time_index))
         
         print(f"  + Temperature mean: {np.mean(temperature):.1f} C")
         print(f"  + Temperature range: [{np.min(temperature):.1f}, {np.max(temperature):.1f}] C")
@@ -803,6 +971,7 @@ class MicrogridSimulation:
         print()
         
         self.results = []
+        self.battery_renewable_energy_kwh = 0.0
 
         # Run timestep-by-timestep simulation
         print("Executing timestep dispatch...")
@@ -816,7 +985,8 @@ class MicrogridSimulation:
                 timestamp=timestamp,
                 ghi_w_m2=solar_irradiance[step],
                 ambient_temp_c=temperature[step],
-                system_size_w=self.pv_gen.array_capacity_kwp * 1000.0
+                system_size_w=self.pv_gen.array_capacity_kwp * 1000.0,
+                isc_temp_coeff_rel=self.pv_model_params['isc_temp_coeff_rel']
             )
             solar_kw = pv_state['pv_power_w'] / 1000.0
             
@@ -831,6 +1001,13 @@ class MicrogridSimulation:
             
             # Step 2: Get load
             load_kw = load_demand[step]
+            battery_energy_before_kwh = self.battery.get_energy_kwh()
+            renewable_share_before = 0.0
+            if battery_energy_before_kwh > 1e-9:
+                renewable_share_before = min(
+                    1.0,
+                    max(0.0, self.battery_renewable_energy_kwh / battery_energy_before_kwh)
+                )
             
             # Step 3: Run dispatch algorithm (Priority: Solar → Wind → Battery → Diesel)
             dispatch = load_following_algorithm(
@@ -843,19 +1020,49 @@ class MicrogridSimulation:
                 battery_variable_cost_per_kwh=self.economic_params['battery_variable_om_per_kwh'],
                 diesel_fuel_price_per_liter=self.economic_params['fuel_price_per_liter'],
                 diesel_variable_om_per_kwh=self.economic_params['diesel_variable_om_per_kwh'],
+                diesel_maintenance_cost_per_hour=self.economic_params['diesel_maintenance_cost_per_hour'],
+                ambient_temp_c=temperature[step],
                 timestep_hr=self.timestep_hours,
                 dispatch_strategy=self.dispatch_strategy
             )
             
             # Step 4: Update system states (battery aging, equipment degradation, etc.)
             self._update_system_states(step)
-            
+
             # Step 5: Record energy balance error for debugging
             power_balance_kw = dispatch.get('error_kw', 0.0)
 
             # Step 6: Store results
             battery_discharge_kw = dispatch.get('battery_discharge_kwh', 0.0) / self.timestep_hours
             battery_charge_kw = dispatch.get('battery_charge_kwh', 0.0) / self.timestep_hours
+            renewable_served_kwh = dispatch.get('renewable_served_kwh', 0.0)
+            battery_discharge_kwh = dispatch.get('battery_discharge_kwh', 0.0)
+            battery_charge_kwh = dispatch.get('battery_charge_kwh', 0.0)
+            diesel_generation_kwh = dispatch.get('diesel', 0.0) * self.timestep_hours
+            diesel_served_kwh = dispatch.get('diesel_served_kwh', 0.0)
+
+            renewable_battery_served_kwh = battery_discharge_kwh * renewable_share_before
+            stored_renewable_removed_kwh = (
+                battery_discharge_kwh / max(self.battery.discharge_efficiency, 1e-9)
+            ) * renewable_share_before
+            self.battery_renewable_energy_kwh = max(
+                0.0,
+                self.battery_renewable_energy_kwh - stored_renewable_removed_kwh
+            )
+
+            renewable_surplus_kwh = max(0.0, solar_kw * self.timestep_hours + wind_kw * self.timestep_hours + hydro_kw * self.timestep_hours - renewable_served_kwh)
+            diesel_surplus_kwh = max(0.0, diesel_generation_kwh - diesel_served_kwh)
+            renewable_charge_input_kwh = min(battery_charge_kwh, renewable_surplus_kwh)
+            diesel_charge_input_kwh = min(
+                max(0.0, battery_charge_kwh - renewable_charge_input_kwh),
+                diesel_surplus_kwh
+            )
+            stored_renewable_added_kwh = renewable_charge_input_kwh * self.battery.charge_efficiency
+            self.battery_renewable_energy_kwh = min(
+                self.battery.get_energy_kwh(),
+                self.battery_renewable_energy_kwh + stored_renewable_added_kwh
+            )
+            total_renewable_served_kwh = renewable_served_kwh + renewable_battery_served_kwh
 
             timestep_result = {
                 'timestamp': timestamp,
@@ -867,6 +1074,8 @@ class MicrogridSimulation:
                 'load_served_kw': dispatch.get('load_served_kw', 0.0),
                 'load_shedding_kw': dispatch.get('load_shedding_kw', 0.0),
                 'renewable_served_kw': dispatch.get('renewable_served_kwh', 0.0) / self.timestep_hours,
+                'renewable_battery_served_kw': renewable_battery_served_kwh / self.timestep_hours,
+                'total_renewable_served_kw': total_renewable_served_kwh / self.timestep_hours,
                 'battery_served_kw': dispatch.get('battery_served_kwh', 0.0) / self.timestep_hours,
                 'diesel_served_kw': dispatch.get('diesel_served_kwh', 0.0) / self.timestep_hours,
 
@@ -887,6 +1096,8 @@ class MicrogridSimulation:
                 'diesel_generation_kw': dispatch.get('diesel', 0.0),
                 'battery_discharge_kw': battery_discharge_kw,
                 'battery_charge_kw': battery_charge_kw,
+                'battery_charge_from_renewables_kw': renewable_charge_input_kwh / self.timestep_hours,
+                'battery_charge_from_diesel_kw': diesel_charge_input_kwh / self.timestep_hours,
                 'curtailment_kw': dispatch.get('curtailment', 0.0),
                 'total_generation_kw': (solar_kw + wind_kw + hydro_kw + dispatch.get('diesel', 0.0)),
                 'total_supply_kw': (solar_kw + wind_kw + hydro_kw + dispatch.get('diesel', 0.0) + battery_discharge_kw),
@@ -905,6 +1116,8 @@ class MicrogridSimulation:
                 'battery_soc_before': dispatch.get('battery_soc_before', np.nan),
                 'battery_soc_after': dispatch.get('battery_soc_after', np.nan),
                 'battery_health': self.battery.current_capacity_kwh / self.battery.nominal_capacity_kwh,
+                'battery_temperature_c': self.battery.current_temp_c,
+                'battery_renewable_energy_kwh': self.battery_renewable_energy_kwh,
             }
 
             self.results.append(timestep_result)
@@ -938,9 +1151,12 @@ class MicrogridSimulation:
                 0.0,
                 (self.battery.total_throughput_mwh - self._last_battery_throughput_mwh) * 1000.0
             )
-            self.battery.apply_calendar_aging(days=1.0)
+            self.battery.apply_calendar_aging(days=1.0, temp_c=self.battery.current_temp_c)
             if daily_throughput_kwh > 0:
-                self.battery.apply_cycle_aging(energy_cycled_kwh=daily_throughput_kwh)
+                self.battery.apply_cycle_aging(
+                    energy_cycled_kwh=daily_throughput_kwh,
+                    temp_c=self.battery.current_temp_c
+                )
             self.battery.complete_cycle()
             self._last_battery_throughput_mwh = self.battery.total_throughput_mwh
     
@@ -966,7 +1182,9 @@ class MicrogridSimulation:
         metrics['total_load_kwh'] = results_df['load_kw'].sum() * self.timestep_hours
         metrics['total_load_served_kwh'] = results_df['load_served_kw'].sum() * self.timestep_hours
         metrics['total_load_shedding_kwh'] = results_df['load_shedding_kw'].sum() * self.timestep_hours
-        metrics['total_renewable_served_kwh'] = results_df['renewable_served_kw'].sum() * self.timestep_hours
+        metrics['total_direct_renewable_served_kwh'] = results_df['renewable_served_kw'].sum() * self.timestep_hours
+        metrics['total_renewable_from_battery_served_kwh'] = results_df['renewable_battery_served_kw'].sum() * self.timestep_hours
+        metrics['total_renewable_served_kwh'] = results_df['total_renewable_served_kw'].sum() * self.timestep_hours
         metrics['total_battery_served_kwh'] = results_df['battery_served_kw'].sum() * self.timestep_hours
         metrics['total_diesel_served_kwh'] = results_df['diesel_served_kw'].sum() * self.timestep_hours
         metrics['simulated_years'] = self.simulated_years
@@ -983,6 +1201,9 @@ class MicrogridSimulation:
         total_renewable = (metrics['total_solar_generation_kwh'] + 
                           metrics['total_wind_generation_kwh'] +
                           metrics['total_hydro_generation_kwh'])
+        metrics['direct_renewable_fraction'] = (
+            metrics['total_direct_renewable_served_kwh'] / (metrics['total_load_served_kwh'] + 1e-6)
+        )
         metrics['renewable_fraction'] = (
             metrics['total_renewable_served_kwh'] / (metrics['total_load_served_kwh'] + 1e-6)
         )
@@ -992,6 +1213,8 @@ class MicrogridSimulation:
         metrics['min_battery_soc'] = results_df['battery_soc_after'].min()
         metrics['max_battery_soc'] = results_df['battery_soc_after'].max()
         metrics['battery_min_soc_percent'] = self.battery.get_min_soc() * 100.0
+        metrics['average_battery_temperature_c'] = results_df['battery_temperature_c'].mean()
+        metrics['battery_end_of_life_fraction'] = getattr(self.battery, 'end_of_life_capacity_fraction', 0.80)
         
         # Cost metrics
         metrics['total_operating_cost'] = results_df['operating_cost'].sum()
@@ -1034,6 +1257,7 @@ class MicrogridSimulation:
             annual_metrics[f'annual_{key}'] = self._annualize_value(metrics[key])
 
         metrics.update(annual_metrics)
+        metrics['annual_average_battery_temperature_c'] = metrics['average_battery_temperature_c']
 
         lifecycle_cashflow, lifecycle_metrics = self._build_lifecycle_cashflow({
             'total_load_served_kwh': metrics['annual_total_load_served_kwh'],
@@ -1043,8 +1267,22 @@ class MicrogridSimulation:
             'total_battery_discharge_kwh': metrics['annual_total_battery_discharge_kwh'],
             'total_battery_throughput_kwh': metrics['annual_total_battery_throughput_kwh'],
             'diesel_runtime_hours': metrics['annual_diesel_runtime_hours'],
+            'average_battery_temperature_c': metrics['annual_average_battery_temperature_c'],
         })
         self.economic_cashflow = lifecycle_cashflow
+
+        monte_carlo_samples, monte_carlo_summary = self._run_monte_carlo_financial_risk({
+            'total_load_served_kwh': metrics['annual_total_load_served_kwh'],
+            'total_load_shedding_kwh': metrics['annual_total_load_shedding_kwh'],
+            'total_fuel_liters': metrics['annual_total_fuel_liters'],
+            'total_diesel_generation_kwh': metrics['annual_total_diesel_generation_kwh'],
+            'total_battery_discharge_kwh': metrics['annual_total_battery_discharge_kwh'],
+            'total_battery_throughput_kwh': metrics['annual_total_battery_throughput_kwh'],
+            'diesel_runtime_hours': metrics['annual_diesel_runtime_hours'],
+            'average_battery_temperature_c': metrics['annual_average_battery_temperature_c'],
+        })
+        self.monte_carlo_samples = monte_carlo_samples
+        self.monte_carlo_summary = monte_carlo_summary
 
         metrics['upfront_capex'] = lifecycle_metrics['upfront_capex']
         metrics['discounted_lifecycle_cost'] = lifecycle_metrics['discounted_lifecycle_cost']
@@ -1057,6 +1295,26 @@ class MicrogridSimulation:
         metrics['project_lifetime_years'] = lifecycle_metrics['project_lifetime_years']
         metrics['annual_fixed_om_base'] = lifecycle_metrics['annual_fixed_om_base']
         metrics['battery_replacement_interval_years'] = lifecycle_metrics['battery_replacement_interval_years']
+        metrics['annual_debt_service'] = lifecycle_metrics['annual_debt_service']
+        metrics['average_dscr'] = lifecycle_metrics['average_dscr']
+        metrics['minimum_dscr'] = lifecycle_metrics['minimum_dscr']
+        if not monte_carlo_summary.empty:
+            lcoe_row = monte_carlo_summary.loc[monte_carlo_summary['metric'] == 'lcoe'].iloc[0]
+            dscr_row = monte_carlo_summary.loc[monte_carlo_summary['metric'] == 'minimum_dscr'].iloc[0]
+            npv_row = monte_carlo_summary.loc[monte_carlo_summary['metric'] == 'discounted_lifecycle_cost'].iloc[0]
+            metrics['monte_carlo_runs'] = len(monte_carlo_samples)
+            metrics['lcoe_p50'] = lcoe_row['p50']
+            metrics['lcoe_p90'] = lcoe_row['p90']
+            metrics['discounted_lifecycle_cost_p50'] = npv_row['p50']
+            metrics['discounted_lifecycle_cost_p90'] = npv_row['p90']
+            metrics['minimum_dscr_p10'] = dscr_row['p10']
+        else:
+            metrics['monte_carlo_runs'] = 0
+            metrics['lcoe_p50'] = np.nan
+            metrics['lcoe_p90'] = np.nan
+            metrics['discounted_lifecycle_cost_p50'] = np.nan
+            metrics['discounted_lifecycle_cost_p90'] = np.nan
+            metrics['minimum_dscr_p10'] = np.nan
         
         # Print metrics
         print(f"\nGENERATION SUMMARY:")
@@ -1078,6 +1336,9 @@ class MicrogridSimulation:
         print(f"\nRENEWABLE PENETRATION:")
         print(f"  Gross Renewable:      {total_renewable:>12,.1f} kWh")
         print(f"  Renewable Served:     {metrics['total_renewable_served_kwh']:>12,.1f} kWh")
+        print(f"  Direct Renewable:     {metrics['total_direct_renewable_served_kwh']:>12,.1f} kWh")
+        print(f"  Renewable via Battery:{metrics['total_renewable_from_battery_served_kwh']:>12,.1f} kWh")
+        print(f"  Direct Ren. Fraction: {metrics['direct_renewable_fraction']:>12.2%}")
         print(f"  Renewable Fraction:   {metrics['renewable_fraction']:>12.2%}")
         
         print(f"\nBATTERY PERFORMANCE:")

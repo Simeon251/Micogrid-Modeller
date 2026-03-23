@@ -31,7 +31,9 @@ class MicrogridLoad:
                  growth_rate=0.02, 
                  technical_loss=0.05,
                  non_technical_loss=0.03,
-                 holiday_multiplier=0.9):
+                 holiday_multiplier=0.9,
+                 price_elasticity=0.0,
+                 tariff_multiplier=1.0):
 
         if 1440 % timestep_minutes != 0: 
             raise ValueError("timestep_minutes must divide 1440 evenly.")
@@ -63,6 +65,8 @@ class MicrogridLoad:
         self.technical_loss = technical_loss
         self.non_technical_loss = non_technical_loss
         self.holiday_multiplier = holiday_multiplier
+        self.price_elasticity = price_elasticity
+        self.tariff_multiplier = max(tariff_multiplier, 1e-6)
 
     # ---------------------------------------------------------
     # Preset Profiles
@@ -166,6 +170,10 @@ class MicrogridLoad:
         years_since_base = year - self.base_year
         load *= (1 + self.growth_rate) ** years_since_base
 
+        # -------- Price Elasticity --------
+        # A tariff multiplier above 1.0 reduces demand when elasticity is negative.
+        load *= self.tariff_multiplier ** self.price_elasticity
+
         # -------- Loss Modeling --------
         total_loss_fraction = (
             self.technical_loss +
@@ -227,7 +235,10 @@ class MicrogridLoad:
         # Apply growth
         years_since_base = timestamp.year - self.base_year
         load *= (1 + self.growth_rate) ** years_since_base
-        
+
+        # Apply price elasticity
+        load *= self.tariff_multiplier ** self.price_elasticity
+
         # Apply losses
         total_loss_fraction = (
             self.technical_loss +

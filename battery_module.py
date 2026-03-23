@@ -381,8 +381,10 @@ class KiBaMBattery:
                  k_rate=0.1,
                  c_fraction=0.3,
                  temperature_coefficient=-0.003,
+                 degradation_temp_sensitivity=0.025,
                  calendar_fade_rate=0.0003,
                  cycle_fade_per_kwh=0.00001,
+                 end_of_life_capacity_fraction=0.80,
                  lifetime_throughput_MWh=None,
                  lifetime_cycles=None,
                  lifetime_years=10.0):
@@ -417,8 +419,10 @@ class KiBaMBattery:
 
         # Aging parameters
         self.temperature_coefficient = temperature_coefficient
+        self.degradation_temp_sensitivity = degradation_temp_sensitivity
         self.calendar_fade_rate = calendar_fade_rate
         self.cycle_fade_per_kwh = cycle_fade_per_kwh
+        self.end_of_life_capacity_fraction = end_of_life_capacity_fraction
         self.nominal_capacity_kwh = energy_capacity_kwh
         self.current_capacity_kwh = energy_capacity_kwh
         self.lifetime_throughput_MWh = lifetime_throughput_MWh
@@ -432,6 +436,13 @@ class KiBaMBattery:
         self.soc_at_cycle_start = 1.0
         self.throughput_since_cycle_max = 0.0
         self.operating_hours = 0.0
+        self.current_temp_c = 25.0
+
+    def _temperature_fade_multiplier(self, temp_c=None):
+        """Return a degradation multiplier relative to 25 C."""
+        if temp_c is None:
+            temp_c = self.current_temp_c
+        return max(0.25, 1.0 + self.degradation_temp_sensitivity * (temp_c - 25.0))
 
     def _current_from_power(self, power_kw):
         """Convert power (kW) to current (A) using nominal voltage."""
@@ -473,7 +484,7 @@ class KiBaMBattery:
         max_output_by_capacity = energy_available * max(self.discharge_efficiency, 1e-6) / max(timestep_hr, 1e-6)
         return min(self.power_capacity_kw, max_output_by_capacity)
 
-    def charge(self, power_kw, timestep_hr=1.0):
+    def charge(self, power_kw, timestep_hr=1.0, temp_c=None):
         """Charge the battery using power (kW) for timestep (h).
 
         Returns:
@@ -481,6 +492,9 @@ class KiBaMBattery:
         """
         if power_kw <= 0:
             return 0.0
+
+        if temp_c is not None:
+            self.current_temp_c = temp_c
 
         # Limit input power by battery capability and remaining capacity
         max_input_power = self.get_max_charge_power(timestep_hr=timestep_hr)
@@ -504,7 +518,7 @@ class KiBaMBattery:
         self._track_throughput(energy_stored_kwh)
         return energy_drawn_kwh
 
-    def discharge(self, power_kw, timestep_hr=1.0):
+    def discharge(self, power_kw, timestep_hr=1.0, temp_c=None):
         """Discharge the battery to deliver power (kW) for timestep (h).
 
         Returns:
@@ -512,6 +526,9 @@ class KiBaMBattery:
         """
         if power_kw <= 0:
             return 0.0
+
+        if temp_c is not None:
+            self.current_temp_c = temp_c
 
         # Limit output power by capability and available energy
         max_output_power = self.get_max_discharge_power(timestep_hr=timestep_hr)
@@ -541,9 +558,10 @@ class KiBaMBattery:
         self.throughput_since_cycle_max += energy_kwh
         self.operating_hours += energy_kwh / max(self.power_capacity_kw, 1e-6)
 
-    def apply_calendar_aging(self, days=1.0):
+    def apply_calendar_aging(self, days=1.0, temp_c=None):
         """Apply simple calendar aging."""
-        fade_factor = (1.0 - self.calendar_fade_rate) ** days
+        temp_multiplier = self._temperature_fade_multiplier(temp_c)
+        fade_factor = (1.0 - self.calendar_fade_rate * temp_multiplier) ** days
         self.current_capacity_kwh *= fade_factor
         # Adjust capacity in Ah to match kWh
         self.capacity_ah = (self.current_capacity_kwh * 1000.0) / self.nominal_voltage
@@ -555,11 +573,12 @@ class KiBaMBattery:
             self.available_ah *= scale
             self.bound_ah *= scale
 
-    def apply_cycle_aging(self, energy_cycled_kwh=None):
+    def apply_cycle_aging(self, energy_cycled_kwh=None, temp_c=None):
         """Apply cycle aging based on energy throughput."""
         if energy_cycled_kwh is None:
             energy_cycled_kwh = self.throughput_since_cycle_max
-        fade = energy_cycled_kwh * self.cycle_fade_per_kwh
+        temp_multiplier = self._temperature_fade_multiplier(temp_c)
+        fade = energy_cycled_kwh * self.cycle_fade_per_kwh * temp_multiplier
         self.current_capacity_kwh = max(0.1, self.current_capacity_kwh - fade)
         self.capacity_ah = (self.current_capacity_kwh * 1000.0) / self.nominal_voltage
 
@@ -573,6 +592,8 @@ class KiBaMBattery:
 
     def is_dead(self):
         if self.current_capacity_kwh <= 0:
+            return True
+        if self.current_capacity_kwh <= self.nominal_capacity_kwh * self.end_of_life_capacity_fraction:
             return True
         if self.lifetime_throughput_MWh is not None and self.total_throughput_mwh >= self.lifetime_throughput_MWh:
             return True
@@ -592,6 +613,7 @@ class KiBaMBattery:
             'total_throughput_mwh': self.total_throughput_mwh,
             'cycle_count': self.cycle_count,
             'is_end_of_life': self.is_dead(),
+            'current_temp_c': self.current_temp_c,
         }
 
     def __repr__(self):
