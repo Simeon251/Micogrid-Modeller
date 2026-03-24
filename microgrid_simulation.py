@@ -43,6 +43,8 @@ class MicrogridSimulation:
                  timestep_minutes=60,
                  num_days=365,
                  start_date='2026-01-01',
+                 location_lat=-1.94,
+                 location_lon=30.06,
                  pv_capacity_kwp=500.0,
                  wind_capacity_kw=200.0,
                  hydro_capacity_kw=0.0,
@@ -105,6 +107,8 @@ class MicrogridSimulation:
         self.load_profile_file = load_profile_file
         self.resource_profile_file = resource_profile_file
         self.random_seed = random_seed
+        self.location_lat = float(location_lat)
+        self.location_lon = float(location_lon)
         self.simulated_years = max(num_days / 365.0, 1.0 / 365.0)
 
         if random_seed is not None:
@@ -166,8 +170,23 @@ class MicrogridSimulation:
             'min_load_factor': 0.25
         }
         if diesel_params:
-            diesel_config.update(diesel_params)
+            diesel_config.update({
+                k: v for k, v in diesel_params.items()
+                if k not in {
+                    'enable_generator_reliability',
+                    'mtbf_hours',
+                    'mttr_hours',
+                    'planned_maintenance_interval_hours',
+                    'planned_maintenance_duration_hours',
+                }
+            })
         self.diesel_gen = DieselGenerator(**diesel_config)
+        self.diesel_reliability = self._build_diesel_reliability_params(diesel_params)
+        self.diesel_outage_remaining_steps = 0
+        self.diesel_outage_reason = "available"
+        self.next_planned_maintenance_runtime_hours = self.diesel_reliability['planned_maintenance_interval_hours']
+        self.diesel_forced_outage_events = 0
+        self.diesel_planned_outage_events = 0
         # Use the KiBaM battery model for current-based storage dynamics.
         battery_config = {
             'energy_capacity_kwh': battery_capacity_kwh,
@@ -187,8 +206,21 @@ class MicrogridSimulation:
             'base_year': self.start_date.year
         }
         if load_params:
-            load_config.update(load_params)
+            load_config.update({
+                k: v for k, v in load_params.items()
+                if k not in {
+                    'enable_dsm',
+                    'deferrable_load_fraction',
+                    'peak_reduction_fraction',
+                    'peak_start_hour',
+                    'peak_end_hour',
+                    'shift_start_hour',
+                    'shift_end_hour',
+                }
+            })
         self.load_model = MicrogridLoad(**load_config)
+        self.dsm_params = self._build_dsm_params(load_params)
+        self.dsm_summary = {}
         self.economic_params = self._build_economic_params(economic_params)
         self._last_battery_throughput_mwh = 0.0
 
@@ -202,7 +234,12 @@ class MicrogridSimulation:
         print(f"  + Battery: {battery_capacity_kwh} kWh / {battery_power_kw} kW")
         print(f"  + Load: {base_load_kw} kW base ({load_type})")
         print(f"  + Dispatch: {dispatch_strategy}")
+        print(f"  + Synthetic resource location: ({self.location_lat:.2f}, {self.location_lon:.2f})")
         print(f"  + Project life: {self.economic_params['project_lifetime_years']} years")
+        if self.dsm_params['enable_dsm']:
+            print("  + DSM enabled")
+        if self.diesel_reliability['enable_generator_reliability']:
+            print("  + Diesel reliability enabled")
         if load_profile_file:
             print(f"  + Load profile file: {load_profile_file}")
         if resource_profile_file:
@@ -273,6 +310,38 @@ class MicrogridSimulation:
         }
         if overrides:
             defaults.update(overrides)
+        return defaults
+
+    def _build_dsm_params(self, load_params=None):
+        """Build demand-side management configuration."""
+        defaults = {
+            'enable_dsm': False,
+            'deferrable_load_fraction': 0.0,
+            'peak_reduction_fraction': 0.0,
+            'peak_start_hour': 18,
+            'peak_end_hour': 22,
+            'shift_start_hour': 10,
+            'shift_end_hour': 16,
+        }
+        if load_params:
+            for key in defaults:
+                if key in load_params:
+                    defaults[key] = load_params[key]
+        return defaults
+
+    def _build_diesel_reliability_params(self, diesel_params=None):
+        """Build diesel outage and repair assumptions."""
+        defaults = {
+            'enable_generator_reliability': False,
+            'mtbf_hours': 500.0,
+            'mttr_hours': 8.0,
+            'planned_maintenance_interval_hours': 1000.0,
+            'planned_maintenance_duration_hours': 6.0,
+        }
+        if diesel_params:
+            for key in defaults:
+                if key in diesel_params:
+                    defaults[key] = diesel_params[key]
         return defaults
 
     def _annualize_value(self, value):
@@ -623,6 +692,147 @@ class MicrogridSimulation:
                 return normalized[key]
         return None
 
+    def _extract_location_from_resource_profile(self, resource_df):
+        """Update synthetic-resource location from resource profile metadata when available."""
+        lat_col = self._find_column(resource_df, ['latitude', 'lat'])
+        lon_col = self._find_column(resource_df, ['longitude', 'lon', 'lng'])
+        if lat_col is not None:
+            lat_values = resource_df[lat_col].dropna()
+            if not lat_values.empty:
+                self.location_lat = float(lat_values.iloc[0])
+        if lon_col is not None:
+            lon_values = resource_df[lon_col].dropna()
+            if not lon_values.empty:
+                self.location_lon = float(lon_values.iloc[0])
+
+    def _hour_mask(self, index, start_hour, end_hour):
+        """Return a boolean mask for hours in a possibly wrap-around interval."""
+        hours = index.hour + index.minute / 60.0
+        if start_hour <= end_hour:
+            return (hours >= start_hour) & (hours < end_hour)
+        return (hours >= start_hour) | (hours < end_hour)
+
+    def _apply_dsm(self, load_series):
+        """Apply simple DSM actions: deferrable-load shifting and peak shaving."""
+        adjusted = load_series.astype(float).copy()
+        dsm_shifted_kw = pd.Series(0.0, index=load_series.index, name='dsm_shifted_load_kw')
+        dsm_peak_reduced_kw = pd.Series(0.0, index=load_series.index, name='dsm_peak_reduction_kw')
+
+        if not self.dsm_params['enable_dsm']:
+            self.dsm_summary = {
+                'total_shifted_load_kwh': 0.0,
+                'total_peak_reduced_kwh': 0.0,
+                'peak_load_before_dsm_kw': float(load_series.max()),
+                'peak_load_after_dsm_kw': float(load_series.max()),
+            }
+            return pd.DataFrame({
+                'baseline_load_kw': load_series,
+                'load_kw': adjusted,
+                'dsm_shifted_load_kw': dsm_shifted_kw,
+                'dsm_peak_reduction_kw': dsm_peak_reduced_kw,
+            })
+
+        peak_mask = self._hour_mask(
+            load_series.index,
+            self.dsm_params['peak_start_hour'],
+            self.dsm_params['peak_end_hour'],
+        )
+        shift_mask = self._hour_mask(
+            load_series.index,
+            self.dsm_params['shift_start_hour'],
+            self.dsm_params['shift_end_hour'],
+        )
+
+        total_shifted_kwh = 0.0
+        for day in pd.Index(load_series.index.normalize().unique()):
+            day_mask = load_series.index.normalize() == day
+            day_peak_idx = load_series.index[day_mask & peak_mask]
+            day_shift_idx = load_series.index[day_mask & shift_mask]
+
+            if len(day_peak_idx) == 0 or len(day_shift_idx) == 0:
+                continue
+
+            shift_fraction = float(np.clip(self.dsm_params['deferrable_load_fraction'], 0.0, 0.95))
+            shift_down_kw = adjusted.loc[day_peak_idx] * shift_fraction
+            shift_energy_kwh = float(shift_down_kw.sum() * self.timestep_hours)
+            if shift_energy_kwh <= 0:
+                continue
+
+            adjusted.loc[day_peak_idx] = adjusted.loc[day_peak_idx] - shift_down_kw
+            dsm_shifted_kw.loc[day_peak_idx] = dsm_shifted_kw.loc[day_peak_idx] - shift_down_kw
+
+            shift_up_kw = shift_energy_kwh / (len(day_shift_idx) * self.timestep_hours)
+            adjusted.loc[day_shift_idx] = adjusted.loc[day_shift_idx] + shift_up_kw
+            dsm_shifted_kw.loc[day_shift_idx] = dsm_shifted_kw.loc[day_shift_idx] + shift_up_kw
+            total_shifted_kwh += shift_energy_kwh
+
+        peak_reduction_fraction = float(np.clip(self.dsm_params['peak_reduction_fraction'], 0.0, 0.95))
+        if peak_reduction_fraction > 0:
+            reduction_kw = adjusted.loc[peak_mask] * peak_reduction_fraction
+            adjusted.loc[peak_mask] = adjusted.loc[peak_mask] - reduction_kw
+            dsm_peak_reduced_kw.loc[peak_mask] = reduction_kw
+
+        adjusted = adjusted.clip(lower=0.0)
+        total_peak_reduced_kwh = float(dsm_peak_reduced_kw.sum() * self.timestep_hours)
+        self.dsm_summary = {
+            'total_shifted_load_kwh': total_shifted_kwh,
+            'total_peak_reduced_kwh': total_peak_reduced_kwh,
+            'peak_load_before_dsm_kw': float(load_series.max()),
+            'peak_load_after_dsm_kw': float(adjusted.max()),
+        }
+
+        return pd.DataFrame({
+            'baseline_load_kw': load_series,
+            'load_kw': adjusted,
+            'dsm_shifted_load_kw': dsm_shifted_kw,
+            'dsm_peak_reduction_kw': dsm_peak_reduced_kw,
+        })
+
+    def _get_diesel_availability(self):
+        """Return diesel availability status and advance outage timers."""
+        if self.diesel_gen.rated_kw <= 0:
+            return False, "not_installed"
+
+        reliability = self.diesel_reliability
+        if not reliability['enable_generator_reliability']:
+            return True, "available"
+
+        if self.diesel_outage_remaining_steps > 0:
+            self.diesel_outage_remaining_steps -= 1
+            if self.diesel_outage_remaining_steps <= 0:
+                self.diesel_outage_reason = "available"
+                return True, "available"
+            return False, self.diesel_outage_reason
+
+        if (
+            reliability['planned_maintenance_interval_hours'] > 0 and
+            self.diesel_gen.runtime_hours >= self.next_planned_maintenance_runtime_hours
+        ):
+            duration_steps = max(
+                1,
+                int(np.ceil(reliability['planned_maintenance_duration_hours'] / max(self.timestep_hours, 1e-9)))
+            )
+            self.diesel_outage_remaining_steps = duration_steps - 1
+            self.diesel_outage_reason = "planned_maintenance"
+            self.diesel_planned_outage_events += 1
+            self.next_planned_maintenance_runtime_hours += reliability['planned_maintenance_interval_hours']
+            return False, self.diesel_outage_reason
+
+        mtbf_hours = reliability['mtbf_hours']
+        if mtbf_hours > 0:
+            outage_probability = min(1.0, self.timestep_hours / mtbf_hours)
+            if np.random.random() < outage_probability:
+                duration_steps = max(
+                    1,
+                    int(np.ceil(reliability['mttr_hours'] / max(self.timestep_hours, 1e-9)))
+                )
+                self.diesel_outage_remaining_steps = duration_steps - 1
+                self.diesel_outage_reason = "forced_outage"
+                self.diesel_forced_outage_events += 1
+                return False, self.diesel_outage_reason
+
+        return True, "available"
+
     def _load_resource_profile(self):
         """Load timestamped meteorological/hydro resource data if provided."""
         if not self.resource_profile_file:
@@ -636,6 +846,7 @@ class MicrogridSimulation:
             raise ValueError(f"No timestamp column found in {resource_path}")
 
         resource_df[timestamp_col] = pd.to_datetime(resource_df[timestamp_col])
+        self._extract_location_from_resource_profile(resource_df)
         resource_df = resource_df.set_index(timestamp_col).sort_index()
         resource_df = resource_df[~resource_df.index.duplicated(keep='first')]
 
@@ -658,12 +869,15 @@ class MicrogridSimulation:
                 print(f"  + Solar irradiance max: {np.max(irradiance):.1f} W/m2")
                 return irradiance
 
-        # Monthly average clearness indices for the default Kigali resource model.
-        kigali_monthly_kt = [0.545, 0.562, 0.553, 0.56, 0.559, 0.591,
-                             0.581, 0.559, 0.566, 0.545, 0.536, 0.535]
+        latitude_scale = min(abs(self.location_lat) / 45.0, 1.0)
+        seasonal_bias = -0.02 * latitude_scale if self.location_lat >= 0 else 0.02 * latitude_scale
+        monthly_kt = np.clip(np.array([
+            0.545, 0.562, 0.553, 0.560, 0.559, 0.591,
+            0.581, 0.559, 0.566, 0.545, 0.536, 0.535
+        ]) + seasonal_bias, 0.35, 0.75)
 
-        sim = SolarResourceSimulator()
-        hourly_irradiance = np.array(sim.run_full_year(kigali_monthly_kt))
+        sim = SolarResourceSimulator(lat=self.location_lat, lon=self.location_lon)
+        hourly_irradiance = np.array(sim.run_full_year(monthly_kt.tolist()))
 
         # Resample to match the simulation timestep if not hourly
         if self.timestep_minutes != 60:
@@ -704,8 +918,8 @@ class MicrogridSimulation:
             # Weibull distribution with daily and seasonal variation
             day_of_year = np.array([d.dayofyear for d in self.time_index])
             
-            # Seasonal variation in wind (typically higher in winter)
-            seasonal_mean = 7 + 3 * np.sin((day_of_year - 80) * 2 * np.pi / 365)
+            hemisphere_shift = 0 if self.location_lat >= 0 else 182
+            seasonal_mean = 7 + 3 * np.sin((day_of_year - 80 - hemisphere_shift) * 2 * np.pi / 365)
             
             # Daily variation (wind often higher during day)
             hour_of_day = np.array([d.hour for d in self.time_index])
@@ -809,8 +1023,18 @@ class MicrogridSimulation:
         day_of_year = np.array([day.dayofyear for day in days])
 
         # Synthetic daily extrema before hourly reconstruction.
-        daily_tmin = 12 + 6 * np.sin((day_of_year - 110) * 2 * np.pi / 365) + np.random.normal(0, 1.0, len(days))
-        daily_tmax = daily_tmin + 8 + 3 * np.sin((day_of_year - 80) * 2 * np.pi / 365) + np.random.normal(0, 1.0, len(days))
+        hemisphere_shift = 0 if self.location_lat >= 0 else 182
+        latitude_temp_offset = -0.12 * abs(self.location_lat)
+        daily_tmin = (
+            12 + latitude_temp_offset +
+            6 * np.sin((day_of_year - 110 - hemisphere_shift) * 2 * np.pi / 365) +
+            np.random.normal(0, 1.0, len(days))
+        )
+        daily_tmax = (
+            daily_tmin + 8 +
+            3 * np.sin((day_of_year - 80 - hemisphere_shift) * 2 * np.pi / 365) +
+            np.random.normal(0, 1.0, len(days))
+        )
         daily_tmax = np.maximum(daily_tmax, daily_tmin + 1.0)
 
         temperature = self._dumortier_hourly_temperature(daily_tmin, daily_tmax)
@@ -852,12 +1076,16 @@ class MicrogridSimulation:
             load_series = load_series.reindex(self.time_index, method='nearest', fill_value=np.nan)
             load_series = load_series.interpolate(method='time').bfill().ffill()
 
-        load_values = load_series.values
+        load_df = self._apply_dsm(load_series)
+        load_values = load_df['load_kw'].values
 
         print(f"  + Load mean: {np.mean(load_values):.1f} kW")
         print(f"  + Load max: {np.max(load_values):.1f} kW")
         print(f"  + Load min: {np.min(load_values):.1f} kW")
-        return load_values
+        if self.dsm_params['enable_dsm']:
+            print(f"  + DSM shifted energy: {self.dsm_summary['total_shifted_load_kwh']:.1f} kWh")
+            print(f"  + DSM peak reduction: {self.dsm_summary['total_peak_reduced_kwh']:.1f} kWh")
+        return load_df
 
     def _generate_hydro_data(self, resource_df=None):
         """Generate or load hydro flow/head data for the simulation horizon."""
@@ -972,6 +1200,11 @@ class MicrogridSimulation:
         
         self.results = []
         self.battery_renewable_energy_kwh = 0.0
+        self.diesel_outage_remaining_steps = 0
+        self.diesel_outage_reason = "available"
+        self.next_planned_maintenance_runtime_hours = self.diesel_reliability['planned_maintenance_interval_hours']
+        self.diesel_forced_outage_events = 0
+        self.diesel_planned_outage_events = 0
 
         # Run timestep-by-timestep simulation
         print("Executing timestep dispatch...")
@@ -1000,7 +1233,11 @@ class MicrogridSimulation:
             )
             
             # Step 2: Get load
-            load_kw = load_demand[step]
+            load_row = load_demand.iloc[step]
+            load_kw = float(load_row['load_kw'])
+            baseline_load_kw = float(load_row['baseline_load_kw'])
+            dsm_shifted_load_kw = float(load_row['dsm_shifted_load_kw'])
+            dsm_peak_reduction_kw = float(load_row['dsm_peak_reduction_kw'])
             battery_energy_before_kwh = self.battery.get_energy_kwh()
             renewable_share_before = 0.0
             if battery_energy_before_kwh > 1e-9:
@@ -1008,6 +1245,8 @@ class MicrogridSimulation:
                     1.0,
                     max(0.0, self.battery_renewable_energy_kwh / battery_energy_before_kwh)
                 )
+
+            diesel_available, diesel_outage_reason = self._get_diesel_availability()
             
             # Step 3: Run dispatch algorithm (Priority: Solar → Wind → Battery → Diesel)
             dispatch = load_following_algorithm(
@@ -1017,6 +1256,7 @@ class MicrogridSimulation:
                 hydro_power_kw=hydro_kw,
                 battery=self.battery,
                 diesel_generator=self.diesel_gen,
+                diesel_available=diesel_available,
                 battery_variable_cost_per_kwh=self.economic_params['battery_variable_om_per_kwh'],
                 diesel_fuel_price_per_liter=self.economic_params['fuel_price_per_liter'],
                 diesel_variable_om_per_kwh=self.economic_params['diesel_variable_om_per_kwh'],
@@ -1070,7 +1310,10 @@ class MicrogridSimulation:
                 'hour_of_year': timestamp.hour + (timestamp.dayofyear - 1) * 24,
 
                 # Demand
+                'baseline_load_kw': baseline_load_kw,
                 'load_kw': load_kw,
+                'dsm_shifted_load_kw': dsm_shifted_load_kw,
+                'dsm_peak_reduction_kw': dsm_peak_reduction_kw,
                 'load_served_kw': dispatch.get('load_served_kw', 0.0),
                 'load_shedding_kw': dispatch.get('load_shedding_kw', 0.0),
                 'renewable_served_kw': dispatch.get('renewable_served_kwh', 0.0) / self.timestep_hours,
@@ -1111,6 +1354,8 @@ class MicrogridSimulation:
                 'fuel_cost': dispatch.get('fuel_liters', 0.0) * self.economic_params['fuel_price_per_liter'],
 
                 # Equipment status
+                'diesel_available': diesel_available,
+                'diesel_outage_reason': diesel_outage_reason,
                 'pv_operating_years': self.pv_gen.operating_years,
                 'diesel_operating_hours': self.diesel_gen.runtime_hours,
                 'battery_soc_before': dispatch.get('battery_soc_before', np.nan),
@@ -1179,9 +1424,12 @@ class MicrogridSimulation:
         metrics['total_generation_kwh'] = results_df['total_generation_kw'].sum() * self.timestep_hours
         metrics['total_supply_kwh'] = results_df['total_supply_kw'].sum() * self.timestep_hours
         
+        metrics['total_baseline_load_kwh'] = results_df['baseline_load_kw'].sum() * self.timestep_hours
         metrics['total_load_kwh'] = results_df['load_kw'].sum() * self.timestep_hours
         metrics['total_load_served_kwh'] = results_df['load_served_kw'].sum() * self.timestep_hours
         metrics['total_load_shedding_kwh'] = results_df['load_shedding_kw'].sum() * self.timestep_hours
+        metrics['total_dsm_shifted_energy_kwh'] = results_df['dsm_shifted_load_kw'].clip(lower=0.0).sum() * self.timestep_hours
+        metrics['total_peak_reduced_energy_kwh'] = results_df['dsm_peak_reduction_kw'].sum() * self.timestep_hours
         metrics['total_direct_renewable_served_kwh'] = results_df['renewable_served_kw'].sum() * self.timestep_hours
         metrics['total_renewable_from_battery_served_kwh'] = results_df['renewable_battery_served_kw'].sum() * self.timestep_hours
         metrics['total_renewable_served_kwh'] = results_df['total_renewable_served_kw'].sum() * self.timestep_hours
@@ -1194,6 +1442,12 @@ class MicrogridSimulation:
         metrics['loss_of_load_probability'] = metrics['loss_of_load_hours'] / (
             len(results_df) * self.timestep_hours + 1e-6
         )
+        metrics['diesel_unavailable_hours'] = (~results_df['diesel_available'].astype(bool)).sum() * self.timestep_hours
+        metrics['diesel_availability_fraction'] = 1.0 - (
+            metrics['diesel_unavailable_hours'] / (len(results_df) * self.timestep_hours + 1e-6)
+        )
+        metrics['diesel_forced_outage_events'] = self.diesel_forced_outage_events
+        metrics['diesel_planned_outage_events'] = self.diesel_planned_outage_events
         metrics['load_served_fraction'] = (metrics['total_load_served_kwh'] / 
                                           (metrics['total_load_kwh'] + 1e-6))
         
@@ -1228,6 +1482,7 @@ class MicrogridSimulation:
 
         # Average power
         metrics['average_load_kw'] = results_df['load_kw'].mean()
+        metrics['peak_baseline_load_kw'] = results_df['baseline_load_kw'].max()
         metrics['peak_load_kw'] = results_df['load_kw'].max()
         metrics['average_solar_kw'] = results_df['solar_generation_kw'].mean()
         metrics['average_wind_kw'] = results_df['wind_generation_kw'].mean()

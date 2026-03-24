@@ -5,6 +5,7 @@ def _economic_dispatch_solution(load_kw,
                                 renewable_kwh,
                                 battery,
                                 diesel_generator,
+                                diesel_available,
                                 battery_variable_cost_per_kwh,
                                 diesel_fuel_price_per_liter,
                                 diesel_variable_om_per_kwh,
@@ -19,18 +20,21 @@ def _economic_dispatch_solution(load_kw,
     max_discharge_kwh = max_discharge_kw * timestep_hr
 
     deficit_kwh = load_kwh - renewable_kwh
+    rated_kw = diesel_generator.rated_kw if diesel_available else 0.0
+    min_load_kw = diesel_generator.min_load_factor * rated_kw if rated_kw > 0 else 0.0
+
     candidate_diesel_kw = {
         0.0,
-        diesel_generator.rated_kw,
+        rated_kw,
         max(0.0, deficit_kwh / timestep_hr) if timestep_hr > 0 else 0.0,
-        diesel_generator.min_load_factor * diesel_generator.rated_kw if deficit_kwh > 0 else 0.0,
+        min_load_kw if deficit_kwh > 0 else 0.0,
     }
 
     feasible = []
     for diesel_kw in sorted(candidate_diesel_kw):
-        if diesel_kw < 0 or diesel_kw > diesel_generator.rated_kw + 1e-9:
+        if diesel_kw < 0 or diesel_kw > rated_kw + 1e-9:
             continue
-        if 0 < diesel_kw < diesel_generator.min_load_factor * diesel_generator.rated_kw:
+        if 0 < diesel_kw < min_load_kw:
             continue
 
         diesel_kwh = diesel_kw * timestep_hr
@@ -83,6 +87,7 @@ def load_following_algorithm(load_kw,
                             hydro_power_kw,
                             battery,
                             diesel_generator,
+                            diesel_available=True,
                             battery_variable_cost_per_kwh=0.0,
                             diesel_fuel_price_per_liter=1.50,
                             diesel_variable_om_per_kwh=0.0,
@@ -129,6 +134,7 @@ def load_following_algorithm(load_kw,
             renewable_kwh=renewable_kwh,
             battery=battery,
             diesel_generator=diesel_generator,
+            diesel_available=diesel_available,
             battery_variable_cost_per_kwh=battery_variable_cost_per_kwh,
             diesel_fuel_price_per_liter=diesel_fuel_price_per_liter,
             diesel_variable_om_per_kwh=diesel_variable_om_per_kwh,
@@ -210,14 +216,17 @@ def load_following_algorithm(load_kw,
             supply_kwh += actual_discharge_kwh
             deficit_kwh = max(0.0, deficit_kwh - actual_discharge_kwh)
 
-    if deficit_kwh > 1e-6:
-        if dispatch_strategy == 'cycle_charging':
-            diesel_kw = diesel_generator.rated_kw
-        else:
-            diesel_kw = min(diesel_generator.rated_kw, deficit_kwh / timestep_hr)
+    rated_kw = diesel_generator.rated_kw if diesel_available else 0.0
+    min_load_kw = diesel_generator.min_load_factor * rated_kw if rated_kw > 0 else 0.0
 
-        if diesel_kw > 0 and diesel_kw < diesel_generator.min_load_factor * diesel_generator.rated_kw:
-            diesel_kw = diesel_generator.min_load_factor * diesel_generator.rated_kw
+    if deficit_kwh > 1e-6 and rated_kw > 0:
+        if dispatch_strategy == 'cycle_charging':
+            diesel_kw = rated_kw
+        else:
+            diesel_kw = min(rated_kw, deficit_kwh / timestep_hr)
+
+        if diesel_kw > 0 and diesel_kw < min_load_kw:
+            diesel_kw = min_load_kw
 
         diesel_kwh = diesel_kw * timestep_hr
         dispatch['diesel'] = diesel_kw

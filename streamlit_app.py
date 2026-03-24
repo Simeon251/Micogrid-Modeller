@@ -306,6 +306,8 @@ with st.sidebar:
     start_date = st.date_input("Start date", value=pd.Timestamp("2026-01-01"), help="Calendar date used to build the simulation time index.")
     dispatch_strategy = st.selectbox("Dispatch strategy", ["economic_dispatch", "load_following", "cycle_charging"], help="`economic_dispatch` chooses the lowest-cost feasible diesel/battery combination each timestep. `load_following` uses diesel only when needed. `cycle_charging` runs diesel at rated output once started and uses surplus to charge the battery.")
     random_seed = st.number_input("Random seed", min_value=0, value=42, step=1, help="Keeps synthetic weather and load generation repeatable so you can compare scenarios fairly.")
+    location_lat = st.number_input("Latitude", value=-1.94, format="%.4f", help="Used for synthetic solar, wind, and temperature patterns when measured resource CSV data is not provided.")
+    location_lon = st.number_input("Longitude", value=30.06, format="%.4f", help="Used for synthetic resource generation and stored with the scenario assumptions.")
     resource_profile_file = st.text_input("Resource profile CSV path", value="", help="Optional path to a timestamped CSV containing measured or forecast resource data such as GHI, wind speed, temperature, hydro flow, and possibly load.")
     load_profile_file = st.text_input("Load profile CSV path", value="", help="Optional path to a CSV with a measured load profile. Use this when you want to replace the synthetic demand model.")
     st.info(
@@ -356,6 +358,13 @@ with st.sidebar:
     fuel_100 = st.number_input("Fuel use at 100% load (L/h)", min_value=0.0, value=14.7, step=0.1, help="Fuel use from the generator datasheet at full load.")
     st.caption("Fuel values should come from the generator fuel-consumption table at different loading points.")
 
+    st.caption("Diesel Reliability")
+    enable_generator_reliability = st.toggle("Enable diesel reliability modeling", value=False, help="Adds planned maintenance and stochastic forced outages using MTBF and MTTR assumptions.")
+    mtbf_hours = st.number_input("Diesel MTBF (hours)", min_value=1.0, value=500.0, step=50.0, help="Average operating time between forced failures.")
+    mttr_hours = st.number_input("Diesel MTTR (hours)", min_value=1.0, value=8.0, step=1.0, help="Average repair duration after a forced outage.")
+    planned_maintenance_interval_hours = st.number_input("Planned maintenance interval (runtime-hours)", min_value=1.0, value=1000.0, step=100.0, help="Runtime interval between planned maintenance shutdowns.")
+    planned_maintenance_duration_hours = st.number_input("Planned maintenance duration (hours)", min_value=1.0, value=6.0, step=1.0, help="Length of each planned maintenance event.")
+
     st.header("Battery Datasheet")
     battery_capacity_kwh = st.number_input("Energy capacity (kWh)", min_value=0.0, value=200.0, step=10.0, help="Total usable battery energy capacity.")
     battery_power_kw = st.number_input("Power capacity (kW)", min_value=0.0, value=60.0, step=5.0, help="Maximum battery charge or discharge power.")
@@ -378,6 +387,15 @@ with st.sidebar:
     technical_loss = st.slider("Technical loss", min_value=0.0, max_value=0.3, value=0.05, step=0.01, help="Distribution and conversion losses added on top of useful load.")
     non_technical_loss = st.slider("Non-technical loss", min_value=0.0, max_value=0.3, value=0.03, step=0.01, help="Commercial or non-metered losses added on top of useful load.")
     st.caption("These fields matter only when you are using the built-in synthetic load model instead of a measured load CSV.")
+
+    st.caption("Demand-Side Management")
+    enable_dsm = st.toggle("Enable DSM", value=False, help="Applies simple load shifting and peak shaving to make demand more flexible.")
+    deferrable_load_fraction = st.slider("Deferrable load fraction", min_value=0.0, max_value=0.6, value=0.15, step=0.01, help="Share of peak-period demand that can be shifted to another time window.")
+    peak_reduction_fraction = st.slider("Peak reduction fraction", min_value=0.0, max_value=0.5, value=0.05, step=0.01, help="Additional peak-period demand that is curtailed rather than shifted.")
+    peak_start_hour = st.slider("Peak start hour", min_value=0, max_value=23, value=18, step=1, help="Start of the demand peak window used by DSM.")
+    peak_end_hour = st.slider("Peak end hour", min_value=1, max_value=24, value=22, step=1, help="End of the demand peak window used by DSM.")
+    shift_start_hour = st.slider("Shift-to start hour", min_value=0, max_value=23, value=10, step=1, help="Start of the preferred window that receives shifted demand.")
+    shift_end_hour = st.slider("Shift-to end hour", min_value=1, max_value=24, value=16, step=1, help="End of the preferred load-shifting window.")
 
     st.header("Economics")
     project_lifetime_years = st.slider("Project life (years)", min_value=1, max_value=30, value=20, help="Years included in the lifecycle cost and LCOE calculation.")
@@ -430,6 +448,8 @@ if run_simulation:
             timestep_minutes=timestep_minutes,
             num_days=num_days,
             start_date=str(start_date),
+            location_lat=location_lat,
+            location_lon=location_lon,
             pv_capacity_kwp=pv_capacity_kwp,
             wind_capacity_kw=wind_capacity_kw,
             hydro_capacity_kw=hydro_capacity_kw,
@@ -476,6 +496,11 @@ if run_simulation:
                     0.75: fuel_75,
                     1.0: fuel_100,
                 },
+                "enable_generator_reliability": enable_generator_reliability,
+                "mtbf_hours": mtbf_hours,
+                "mttr_hours": mttr_hours,
+                "planned_maintenance_interval_hours": planned_maintenance_interval_hours,
+                "planned_maintenance_duration_hours": planned_maintenance_duration_hours,
             },
             battery_params={
                 "nominal_voltage": battery_voltage,
@@ -493,6 +518,13 @@ if run_simulation:
                 "tariff_multiplier": tariff_multiplier,
                 "technical_loss": technical_loss,
                 "non_technical_loss": non_technical_loss,
+                "enable_dsm": enable_dsm,
+                "deferrable_load_fraction": deferrable_load_fraction,
+                "peak_reduction_fraction": peak_reduction_fraction,
+                "peak_start_hour": peak_start_hour,
+                "peak_end_hour": peak_end_hour,
+                "shift_start_hour": shift_start_hour,
+                "shift_end_hour": shift_end_hour,
             },
             economic_params={
                 "project_lifetime_years": project_lifetime_years,
@@ -556,8 +588,14 @@ if run_simulation:
     col13, col14, col15, col16 = st.columns(4)
     col13.metric("Min DSCR", f"{metrics['minimum_dscr']:.2f}" if pd.notna(metrics["minimum_dscr"]) else "N/A")
     col14.metric("Avg DSCR", f"{metrics['average_dscr']:.2f}" if pd.notna(metrics["average_dscr"]) else "N/A")
-    col15.metric("LCOE P50", f"${metrics['lcoe_p50']:.3f}/kWh" if pd.notna(metrics["lcoe_p50"]) else "N/A")
-    col16.metric("LCOE P90", f"${metrics['lcoe_p90']:.3f}/kWh" if pd.notna(metrics["lcoe_p90"]) else "N/A")
+    col15.metric("Diesel Availability", f"{metrics['diesel_availability_fraction']:.1%}")
+    col16.metric("DSM Shifted Energy", f"{metrics['total_dsm_shifted_energy_kwh']:,.1f} kWh")
+
+    col17, col18, col19, col20 = st.columns(4)
+    col17.metric("LCOE P50", f"${metrics['lcoe_p50']:.3f}/kWh" if pd.notna(metrics["lcoe_p50"]) else "N/A")
+    col18.metric("LCOE P90", f"${metrics['lcoe_p90']:.3f}/kWh" if pd.notna(metrics["lcoe_p90"]) else "N/A")
+    col19.metric("Peak Load Before DSM", f"{metrics['peak_baseline_load_kw']:.1f} kW")
+    col20.metric("Peak Load After DSM", f"{metrics['peak_load_kw']:.1f} kW")
 
     st.subheader("Interpretation and Recommendations")
     summary_left, summary_right = st.columns(2)
@@ -597,6 +635,11 @@ if run_simulation:
                             "Total wind generation (kWh)",
                             "Total hydro generation (kWh)",
                             "Total diesel generation (kWh)",
+                            "Diesel availability",
+                            "Forced outage events",
+                            "Planned maintenance events",
+                            "DSM shifted energy (kWh)",
+                            "Peak reduction energy (kWh)",
                             "Direct renewable fraction",
                             "Unmet load fraction",
                             "Loss of load probability",
@@ -607,6 +650,11 @@ if run_simulation:
                             round(metrics["total_wind_generation_kwh"], 2),
                             round(metrics["total_hydro_generation_kwh"], 2),
                             round(metrics["total_diesel_generation_kwh"], 2),
+                            round(metrics["diesel_availability_fraction"], 4),
+                            int(metrics["diesel_forced_outage_events"]),
+                            int(metrics["diesel_planned_outage_events"]),
+                            round(metrics["total_dsm_shifted_energy_kwh"], 2),
+                            round(metrics["total_peak_reduced_energy_kwh"], 2),
                             round(metrics["direct_renewable_fraction"], 4),
                             round(metrics["unmet_load_fraction"], 4),
                             round(metrics["loss_of_load_probability"], 4),
@@ -634,6 +682,13 @@ if run_simulation:
                             "Renewable fraction",
                             "Direct renewable fraction",
                             "Renewable via battery (kWh)",
+                            "Diesel availability fraction",
+                            "Diesel unavailable hours",
+                            "Forced outage events",
+                            "Planned maintenance events",
+                            "Baseline load energy (kWh)",
+                            "DSM shifted energy (kWh)",
+                            "Peak reduction energy (kWh)",
                             "Operating cost per kWh",
                             "Discounted operating cost",
                             "Discounted unserved energy cost",
@@ -650,6 +705,13 @@ if run_simulation:
                             round(metrics["renewable_fraction"], 4),
                             round(metrics["direct_renewable_fraction"], 4),
                             round(metrics["total_renewable_from_battery_served_kwh"], 2),
+                            round(metrics["diesel_availability_fraction"], 4),
+                            round(metrics["diesel_unavailable_hours"], 2),
+                            int(metrics["diesel_forced_outage_events"]),
+                            int(metrics["diesel_planned_outage_events"]),
+                            round(metrics["total_baseline_load_kwh"], 2),
+                            round(metrics["total_dsm_shifted_energy_kwh"], 2),
+                            round(metrics["total_peak_reduced_energy_kwh"], 2),
                             round(metrics["operating_cost_per_kwh_served"], 4),
                             round(metrics["discounted_operating_cost"], 2),
                             round(metrics["discounted_unserved_energy_cost"], 2),
