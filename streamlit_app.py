@@ -124,6 +124,154 @@ def dataframe_csv(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
+def build_interpretation(metrics):
+    interpretations = []
+    recommendations = []
+
+    load_served = metrics.get("load_served_fraction", 0.0)
+    renewable_fraction = metrics.get("renewable_fraction", 0.0)
+    unmet_load_fraction = metrics.get("unmet_load_fraction", 0.0)
+    fuel_used = metrics.get("total_fuel_liters", 0.0)
+    lcoe = metrics.get("lcoe", 0.0)
+    avg_soc = metrics.get("average_battery_soc", 0.0)
+    diesel_runtime = metrics.get("diesel_runtime_hours", 0.0)
+    min_dscr = metrics.get("minimum_dscr")
+    battery_replacement_interval = metrics.get("battery_replacement_interval_years", 0.0)
+    loss_of_load_probability = metrics.get("loss_of_load_probability", 0.0)
+
+    if load_served >= 0.99:
+        interpretations.append(
+            "Reliability is very strong because almost all demand is being served."
+        )
+    elif load_served >= 0.95:
+        interpretations.append(
+            "Reliability is acceptable, but some demand is still not being met."
+        )
+        recommendations.append(
+            "Reduce unmet demand by increasing firm supply, storage, or by lowering peak demand."
+        )
+    else:
+        interpretations.append(
+            "Reliability is weak because a noticeable share of the load is not being served."
+        )
+        recommendations.append(
+            "Prioritize reliability improvements by adding generation capacity, battery storage, or revising the dispatch strategy."
+        )
+
+    if renewable_fraction >= 0.8:
+        interpretations.append(
+            "The system is strongly renewable-led, which helps reduce long-term fuel exposure."
+        )
+    elif renewable_fraction >= 0.5:
+        interpretations.append(
+            "The system has a balanced renewable contribution, but diesel or other non-renewables still play a meaningful role."
+        )
+        recommendations.append(
+            "Test additional PV, wind, or hydro capacity to further reduce fuel dependence if budget allows."
+        )
+    else:
+        interpretations.append(
+            "The system depends heavily on diesel or other non-renewable support."
+        )
+        recommendations.append(
+            "Investigate whether more renewable capacity or better storage sizing can lower diesel dependence and operating cost."
+        )
+
+    if unmet_load_fraction > 0.05 or loss_of_load_probability > 0.05:
+        interpretations.append(
+            "There is a material reliability risk, shown by unmet load or frequent shortage periods."
+        )
+        recommendations.append(
+            "Check the hours with load shedding in the plots and size the system around those shortage periods."
+        )
+
+    if fuel_used > 0 and diesel_runtime > 0:
+        interpretations.append(
+            f"Diesel is actively supporting the microgrid, with {fuel_used:,.1f} L of fuel use over {diesel_runtime:,.1f} runtime hours."
+        )
+        recommendations.append(
+            "If fuel logistics or emissions are a concern, compare this case against a higher-renewable or larger-battery scenario."
+        )
+    else:
+        interpretations.append(
+            "Diesel use is negligible or absent in this simulation, so the system is operating mostly without thermal backup."
+        )
+
+    if avg_soc < 30:
+        interpretations.append(
+            "The battery stays at a low average state of charge, which suggests it may be undersized or frequently depleted."
+        )
+        recommendations.append(
+            "Consider increasing battery capacity, reducing discharge stress, or adding more charging energy from renewables."
+        )
+    elif avg_soc > 85:
+        interpretations.append(
+            "The battery remains mostly full, which can indicate unused storage potential or oversized energy capacity."
+        )
+        recommendations.append(
+            "Check whether battery size can be optimized downward or whether more renewable energy could be shifted into useful load periods."
+        )
+    else:
+        interpretations.append(
+            "Battery utilization appears moderate, which is usually a healthy operating range for daily cycling."
+        )
+
+    if battery_replacement_interval > 0:
+        if battery_replacement_interval < 5:
+            interpretations.append(
+                "The battery replacement interval is short, which may increase lifecycle cost."
+            )
+            recommendations.append(
+                "Review depth of discharge, temperature assumptions, and battery sizing to improve battery life."
+            )
+        elif battery_replacement_interval >= 10:
+            interpretations.append(
+                "The battery replacement interval is relatively long, which supports better lifecycle economics."
+            )
+
+    if lcoe <= 0.2:
+        interpretations.append(
+            f"The modeled cost of energy is relatively low at ${lcoe:.3f}/kWh."
+        )
+    elif lcoe <= 0.4:
+        interpretations.append(
+            f"The modeled cost of energy is moderate at ${lcoe:.3f}/kWh and should be compared with local tariff or benchmark options."
+        )
+        recommendations.append(
+            "Compare the LCOE against the local tariff, diesel-only cost, or your project target before finalizing the design."
+        )
+    else:
+        interpretations.append(
+            f"The modeled cost of energy is high at ${lcoe:.3f}/kWh."
+        )
+        recommendations.append(
+            "Review oversizing, fuel use, and component CAPEX assumptions to identify the main cost drivers."
+        )
+
+    if pd.notna(min_dscr):
+        if min_dscr >= 1.2:
+            interpretations.append(
+                "Debt service coverage looks healthy under the modeled cash flows."
+            )
+        elif min_dscr >= 1.0:
+            interpretations.append(
+                "Debt service coverage is borderline and may be sensitive to cost or tariff changes."
+            )
+            recommendations.append(
+                "Stress-test the project with lower tariffs, higher fuel prices, or lower renewable output before financing decisions."
+            )
+        else:
+            interpretations.append(
+                "Debt service coverage is below 1.0 in at least one year, which signals financeability risk."
+            )
+            recommendations.append(
+                "Improve project cash flow through lower CAPEX, lower debt burden, higher tariff, or better system performance."
+            )
+
+    deduped_recommendations = list(dict.fromkeys(recommendations))
+    return interpretations, deduped_recommendations
+
+
 st.title("Microgrid Modeler")
 st.caption("Enter datasheet values for the currently implemented microgrid resources, storage, and load assumptions, then run the simulation to get interpretable visuals and downloadable results.")
 
@@ -383,6 +531,7 @@ if run_simulation:
         cashflow_df = sim.economic_cashflow
         monte_carlo_df = sim.monte_carlo_summary
         monte_carlo_samples_df = sim.monte_carlo_samples
+        interpretations, recommendations = build_interpretation(metrics)
 
     st.success("Simulation complete.")
 
@@ -409,6 +558,20 @@ if run_simulation:
     col14.metric("Avg DSCR", f"{metrics['average_dscr']:.2f}" if pd.notna(metrics["average_dscr"]) else "N/A")
     col15.metric("LCOE P50", f"${metrics['lcoe_p50']:.3f}/kWh" if pd.notna(metrics["lcoe_p50"]) else "N/A")
     col16.metric("LCOE P90", f"${metrics['lcoe_p90']:.3f}/kWh" if pd.notna(metrics["lcoe_p90"]) else "N/A")
+
+    st.subheader("Interpretation and Recommendations")
+    summary_left, summary_right = st.columns(2)
+    with summary_left:
+        st.markdown("**Interpretation**")
+        for item in interpretations:
+            st.write(f"- {item}")
+    with summary_right:
+        st.markdown("**Recommended actions**")
+        if recommendations:
+            for item in recommendations:
+                st.write(f"- {item}")
+        else:
+            st.write("- The results look broadly balanced. Use scenario comparison to confirm whether this is your preferred design.")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Visuals", "Results Table", "Economics", "Risk", "Downloads"])
 
