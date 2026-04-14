@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 
 from microgrid_simulation import MicrogridSimulation
 
@@ -10,6 +11,145 @@ st.set_page_config(
     page_icon="M",
     layout="wide",
 )
+
+
+st.markdown(
+    """
+    <style>
+    .kpi-card {
+        border-radius: 16px;
+        padding: 16px 18px;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+        margin-bottom: 0.5rem;
+    }
+    .kpi-card .kpi-label {
+        font-size: 0.95rem;
+        color: #334155;
+        margin-bottom: 0.35rem;
+    }
+    .kpi-card .kpi-value {
+        font-size: 2.1rem;
+        font-weight: 700;
+        line-height: 1.15;
+        color: #0f172a;
+    }
+    .kpi-good {
+        background: linear-gradient(180deg, #ecfdf5 0%, #d1fae5 100%);
+    }
+    .kpi-warn {
+        background: linear-gradient(180deg, #fff7ed 0%, #fed7aa 100%);
+    }
+    .kpi-bad {
+        background: linear-gradient(180deg, #fef2f2 0%, #fecaca 100%);
+    }
+    .sidebar-card {
+        border-radius: 16px;
+        padding: 14px 16px;
+        margin: 0.2rem 0 0.8rem 0;
+        background: linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%);
+        border: 1px solid rgba(37, 99, 235, 0.12);
+    }
+    .sidebar-card .title {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin-bottom: 0.2rem;
+    }
+    .sidebar-card .body {
+        font-size: 0.88rem;
+        color: #334155;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h4 {
+        color: #0f172a;
+        letter-spacing: -0.01em;
+    }
+    [data-testid="stSidebar"] [data-testid="stTextInputRootElement"] input,
+    [data-testid="stSidebar"] [data-testid="stNumberInput"] input,
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] > div {
+        border-radius: 12px !important;
+        border-color: rgba(148, 163, 184, 0.45) !important;
+        background: #ffffff !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSlider"] {
+        padding-top: 0.2rem;
+        padding-bottom: 0.35rem;
+    }
+    [data-testid="stSidebar"] details {
+        border: 1px solid rgba(148, 163, 184, 0.20);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.75);
+    }
+    [data-testid="stSidebar"] details summary {
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def get_load_served_kpi_class(load_served_fraction):
+    if load_served_fraction >= 0.99:
+        return "kpi-good"
+    if load_served_fraction >= 0.95:
+        return "kpi-warn"
+    return "kpi-bad"
+
+
+def get_lcoe_kpi_class(lcoe):
+    if lcoe <= 0.40:
+        return "kpi-good"
+    if lcoe <= 0.70:
+        return "kpi-warn"
+    return "kpi-bad"
+
+
+def get_dscr_kpi_class(min_dscr):
+    if pd.isna(min_dscr):
+        return "kpi-warn"
+    if min_dscr >= 1.20:
+        return "kpi-good"
+    if min_dscr >= 1.00:
+        return "kpi-warn"
+    return "kpi-bad"
+
+
+def render_kpi_card(column, label, value, card_class):
+    column.markdown(
+        f"""
+        <div class="kpi-card {card_class}">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_card(title, body):
+    st.markdown(
+        f"""
+        <div class="sidebar-card">
+            <div class="title">{title}</div>
+            <div class="body">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def persist_uploaded_file(uploaded_file, target_name):
+    if uploaded_file is None:
+        return None
+    upload_dir = Path.cwd() / ".uploaded_inputs"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    target_path = upload_dir / target_name
+    target_path.write_bytes(uploaded_file.getbuffer())
+    return str(target_path)
 
 
 def build_timeseries_figure(results_df, days_to_plot, steps_per_day, battery_min_soc_percent):
@@ -52,11 +192,11 @@ def build_timeseries_figure(results_df, days_to_plot, steps_per_day, battery_min
         plot_data["diesel_generation_kw"],
         plot_data["battery_discharge_kw"],
         labels=["PV", "Wind", "Hydro", "Diesel", "Battery"],
-        colors=["#f59e0b", "#38bdf8", "#14b8a6", "#ef4444", "#22c55e"],
+        colors=["#fde047", "#0ea5e9", "#14b8a6", "#ef4444", "#8b5cf6"],
         alpha=0.85,
     )
     axes[2].plot(x_axis, plot_data["load_kw"], color="black", linewidth=2, linestyle="--", label="Load")
-    axes[2].set_title("Generation Mix")
+    axes[2].set_title("Dispatch Over Time")
     axes[2].set_ylabel("kW")
     axes[2].grid(True, alpha=0.25)
     axes[2].legend(loc="upper right", ncol=5)
@@ -72,15 +212,19 @@ def build_timeseries_figure(results_df, days_to_plot, steps_per_day, battery_min
 
 
 def build_energy_mix_figure(metrics):
-    labels = ["PV", "Wind", "Hydro", "Diesel", "Battery"]
-    values = [
-        metrics["total_solar_generation_kwh"],
-        metrics["total_wind_generation_kwh"],
-        metrics["total_hydro_generation_kwh"],
-        metrics["total_diesel_generation_kwh"],
-        metrics["total_battery_discharge_kwh"],
+    labels = [
+        "Direct Renewable",
+        "Renewable via Battery",
+        "Diesel",
+        "Unserved Load",
     ]
-    colors = ["#f59e0b", "#38bdf8", "#14b8a6", "#ef4444", "#22c55e"]
+    values = [
+        metrics["total_direct_renewable_served_kwh"],
+        metrics["total_renewable_from_battery_served_kwh"],
+        metrics["total_diesel_served_kwh"],
+        metrics["total_load_shedding_kwh"],
+    ]
+    colors = ["#2563eb", "#7c3aed", "#ea580c", "#475569"]
 
     filtered = [
         (label, value, color)
@@ -100,7 +244,112 @@ def build_energy_mix_figure(metrics):
         )
     else:
         ax.text(0.5, 0.5, "No energy contribution", ha="center", va="center")
-    ax.set_title("Energy Contribution Mix")
+    ax.set_title("Served Energy Share")
+    fig.tight_layout()
+    return fig
+
+
+def build_served_load_breakdown_figure(metrics):
+    labels = ["Served", "Unserved"]
+    values = [
+        metrics["total_load_served_kwh"],
+        metrics["total_load_shedding_kwh"],
+    ]
+    colors = ["#16a34a", "#dc2626"]
+
+    fig, ax = plt.subplots(figsize=(6.5, 1.8))
+    ax.barh(["Load"], [values[0]], color=colors[0], label=labels[0])
+    if values[1] > 0:
+        ax.barh(["Load"], [values[1]], left=[values[0]], color=colors[1], label=labels[1])
+    ax.set_title("Load Service Breakdown")
+    ax.set_xlabel("Energy (kWh)")
+    ax.grid(True, axis="x", alpha=0.25)
+    ax.legend(loc="upper right", ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+def build_resource_quality_figure(metrics):
+    curtailment = metrics["total_curtailment_kwh"]
+    renewable_used = metrics["total_renewable_served_kwh"]
+    direct_renewable = metrics["total_direct_renewable_served_kwh"]
+    renewable_battery = metrics["total_renewable_from_battery_served_kwh"]
+
+    categories = [
+        "Direct RE",
+        "RE via battery",
+        "Curtailment",
+    ]
+    values = [direct_renewable, renewable_battery, curtailment]
+    colors = ["#f59e0b", "#22c55e", "#94a3b8"]
+
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    bars = ax.bar(categories, values, color=colors, alpha=0.9)
+    ax.set_title("Renewable Energy Utilization")
+    ax.set_ylabel("Energy (kWh)")
+    ax.grid(True, axis="y", alpha=0.25)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:,.0f}", ha="center", va="bottom", fontsize=9)
+    utilization = renewable_used / max(renewable_used + curtailment, 1e-6)
+    ax.text(
+        0.02,
+        0.95,
+        f"Renewable utilization: {utilization:.1%}",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cbd5e1"},
+    )
+    fig.tight_layout()
+    return fig
+
+
+def build_financial_risk_figure(metrics):
+    labels = ["Min DSCR", "Avg DSCR", "LCOE", "LCOE P90"]
+    values = [
+        metrics["minimum_dscr"] if pd.notna(metrics["minimum_dscr"]) else 0.0,
+        metrics["average_dscr"] if pd.notna(metrics["average_dscr"]) else 0.0,
+        metrics["lcoe"],
+        metrics["lcoe_p90"] if pd.notna(metrics["lcoe_p90"]) else metrics["lcoe"],
+    ]
+    colors = ["#dc2626" if values[0] < 1.0 else "#16a34a", "#dc2626" if values[1] < 1.0 else "#16a34a", "#2563eb", "#7c3aed"]
+
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    bars = ax.bar(labels, values, color=colors, alpha=0.9)
+    ax.axhline(1.2, color="#b91c1c", linestyle="--", linewidth=1, alpha=0.7)
+    ax.set_title("Finance and Risk Snapshot")
+    ax.grid(True, axis="y", alpha=0.25)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}", ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def build_generation_totals_figure(metrics):
+    labels = ["PV", "Wind", "Hydro", "Diesel", "Battery discharge"]
+    values = [
+        metrics["total_solar_generation_kwh"],
+        metrics["total_wind_generation_kwh"],
+        metrics["total_hydro_generation_kwh"],
+        metrics["total_diesel_generation_kwh"],
+        metrics["total_battery_discharge_kwh"],
+    ]
+    colors = ["#fde047", "#0ea5e9", "#14b8a6", "#ef4444", "#8b5cf6"]
+
+    filtered = [(label, value, color) for label, value, color in zip(labels, values, colors) if value > 1e-6]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    if filtered:
+        filtered_labels, filtered_values, filtered_colors = zip(*filtered)
+        bars = ax.bar(filtered_labels, filtered_values, color=filtered_colors, alpha=0.9)
+        ax.set_ylabel("Energy (kWh)")
+        ax.set_title("Generation Totals by Source")
+        ax.grid(True, axis="y", alpha=0.25)
+        for bar, value in zip(bars, filtered_values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:,.0f}", ha="center", va="bottom", fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No generation", ha="center", va="center")
+        ax.set_title("Generation Totals by Source")
     fig.tight_layout()
     return fig
 
@@ -272,6 +521,75 @@ def build_interpretation(metrics):
     return interpretations, deduped_recommendations
 
 
+def build_model_use_notes(metrics, has_resource_profile, has_load_profile):
+    data_mode = metrics.get("resource_data_mode", "synthetic_profiles")
+    notes = []
+    notes.append(
+        f"Resource basis: `{data_mode}`. Measured resource data supports stronger validation than synthetic weather."
+    )
+    notes.append(
+        f"PV performance summary: specific yield is {metrics.get('pv_specific_yield_kwh_per_kwp_year', 0.0):.1f} kWh/kWp-year and solar capacity factor is {metrics.get('solar_capacity_factor', 0.0):.1%}."
+    )
+    notes.append(
+        f"Energy-balance check: absolute balance error is {metrics.get('absolute_energy_balance_error_kwh', 0.0):.3f} kWh over the run, which should stay close to zero."
+    )
+    if metrics.get("monte_carlo_runs", 0) > 0:
+        notes.append(
+            f"Risk view: Monte Carlo provides LCOE P50/P90 and DSCR downside metrics across {int(metrics['monte_carlo_runs'])} runs."
+        )
+    else:
+        notes.append(
+            "Risk view: Monte Carlo is disabled, so uncertainty is not being quantified in this run."
+        )
+
+    validation_checks = [
+        "Compare simulated energy, peak load, and fuel use against measured or expected project values.",
+        "Run one-at-a-time sensitivities for fuel price, tariff, load growth, PV yield, and battery size.",
+        "Use scenarios to compare alternative system designs rather than relying on a single base case.",
+    ]
+    if not has_resource_profile:
+        validation_checks.append(
+            "State clearly that solar, wind, and temperature are synthetic because no measured resource CSV was provided."
+        )
+    if not has_load_profile:
+        validation_checks.append(
+            "State clearly that demand is synthetic because no measured load CSV was provided."
+        )
+
+    limitations = [
+        "Synthetic resource profiles are suitable for early-stage screening, not bankable energy assessment.",
+        "Dispatch is simplified and does not include all operational constraints of real commercial microgrids.",
+        "Financial risk is sampled around key variables, but model-structure uncertainty still remains.",
+    ]
+    return notes, validation_checks, limitations
+
+
+def build_financeability_message(metrics):
+    min_dscr = metrics.get("minimum_dscr")
+    avg_dscr = metrics.get("average_dscr")
+    lcoe = metrics.get("lcoe", 0.0)
+    tariff_p50 = metrics.get("lcoe_p50")
+
+    if pd.isna(min_dscr) or pd.isna(avg_dscr):
+        return "info", "Financeability metrics are unavailable for this run."
+
+    if min_dscr >= 1.20:
+        return "success", (
+            f"Financeability looks healthy. Minimum DSCR is {min_dscr:.2f}, which is above a common lender threshold of 1.20."
+        )
+    if min_dscr >= 1.00:
+        return "warning", (
+            f"Financeability is borderline. Minimum DSCR is {min_dscr:.2f}, so modest changes in tariff, cost, or performance could push the project below debt-service coverage."
+        )
+    if lcoe > 0 and avg_dscr < 1.0:
+        return "error", (
+            f"This case appears physically workable but economically unfinanceable under the current assumptions. Minimum DSCR is {min_dscr:.2f} and LCOE is ${lcoe:.3f}/kWh."
+        )
+    return "warning", (
+        f"Debt-service coverage is weak. Minimum DSCR is {min_dscr:.2f}; review tariff, CAPEX, fuel exposure, and reliability assumptions."
+    )
+
+
 st.title("Microgrid Modeler")
 st.caption("Enter datasheet values for the currently implemented microgrid resources, storage, and load assumptions, then run the simulation to get interpretable visuals and downloadable results.")
 
@@ -299,50 +617,71 @@ with st.sidebar:
             """
         )
 
-    st.header("Simulation Setup")
+    render_sidebar_card("Simulation Setup", "Choose the model horizon, dispatch strategy, site, and any measured CSV inputs.")
 
-    timestep_minutes = st.selectbox("Timestep (minutes)", [15, 30, 60], index=2, help="Length of each simulation step. Smaller timesteps capture faster system dynamics but take more computation.")
-    num_days = st.slider("Simulation duration (days)", min_value=1, max_value=365, value=30, help="How many days the simulator will model before annualizing the results for lifecycle economics.")
-    start_date = st.date_input("Start date", value=pd.Timestamp("2026-01-01"), help="Calendar date used to build the simulation time index.")
+    setup_col1, setup_col2 = st.columns(2)
+    timestep_minutes = setup_col1.selectbox("Timestep (minutes)", [15, 30, 60], index=2, help="Length of each simulation step. Smaller timesteps capture faster system dynamics but take more computation.")
+    num_days = setup_col2.slider("Simulation duration (days)", min_value=1, max_value=365, value=30, help="How many days the simulator will model before annualizing the results for lifecycle economics.")
+    start_date = setup_col1.date_input("Start date", value=pd.Timestamp("2026-01-01"), help="Calendar date used to build the simulation time index.")
+    random_seed = setup_col2.number_input("Random seed", min_value=0, value=42, step=1, help="Keeps synthetic weather and load generation repeatable so you can compare scenarios fairly.")
     dispatch_strategy = st.selectbox("Dispatch strategy", ["economic_dispatch", "load_following", "cycle_charging"], help="`economic_dispatch` chooses the lowest-cost feasible diesel/battery combination each timestep. `load_following` uses diesel only when needed. `cycle_charging` runs diesel at rated output once started and uses surplus to charge the battery.")
-    random_seed = st.number_input("Random seed", min_value=0, value=42, step=1, help="Keeps synthetic weather and load generation repeatable so you can compare scenarios fairly.")
-    location_lat = st.number_input("Latitude", value=-1.94, format="%.4f", help="Used for synthetic solar, wind, and temperature patterns when measured resource CSV data is not provided.")
-    location_lon = st.number_input("Longitude", value=30.06, format="%.4f", help="Used for synthetic resource generation and stored with the scenario assumptions.")
+    loc_col1, loc_col2 = st.columns(2)
+    location_lat = loc_col1.number_input("Latitude", value=-1.94, format="%.4f", help="Used for synthetic solar, wind, and temperature patterns when measured resource CSV data is not provided.")
+    location_lon = loc_col2.number_input("Longitude", value=30.06, format="%.4f", help="Used for synthetic resource generation and stored with the scenario assumptions.")
+    resource_upload = st.file_uploader("Upload resource CSV", type=["csv"], help="Upload measured or forecast resource data instead of typing a file path.")
     resource_profile_file = st.text_input("Resource profile CSV path", value="", help="Optional path to a timestamped CSV containing measured or forecast resource data such as GHI, wind speed, temperature, hydro flow, and possibly load.")
+    load_upload = st.file_uploader("Upload load CSV", type=["csv"], help="Upload measured demand data instead of typing a file path.")
     load_profile_file = st.text_input("Load profile CSV path", value="", help="Optional path to a CSV with a measured load profile. Use this when you want to replace the synthetic demand model.")
     st.info(
-        "Use `economic_dispatch` to minimize timestep operating cost, `load_following` for renewable-first dispatch, and `cycle_charging` when diesel should charge the battery whenever it starts."
+        "Choose `economic_dispatch` for lowest operating cost, `load_following` for a renewable-first strategy, or `cycle_charging` when diesel should run harder and charge the battery whenever it turns on."
     )
     st.caption("Tip: Measured CSV data usually gives better results than the synthetic defaults.")
+    uploaded_resource_path = persist_uploaded_file(resource_upload, "resource_profile_upload.csv")
+    uploaded_load_path = persist_uploaded_file(load_upload, "load_profile_upload.csv")
+    effective_resource_profile_file = uploaded_resource_path or (resource_profile_file.strip() or None)
+    effective_load_profile_file = uploaded_load_path or (load_profile_file.strip() or None)
+    if uploaded_resource_path:
+        st.caption(f"Using uploaded resource CSV: `{Path(uploaded_resource_path).name}`")
+    if uploaded_load_path:
+        st.caption(f"Using uploaded load CSV: `{Path(uploaded_load_path).name}`")
 
-    st.header("PV Datasheet")
-    pv_capacity_kwp = st.number_input("Array capacity (kWp)", min_value=0.0, value=100.0, step=10.0, help="Installed DC PV array size at standard test conditions.")
-    pv_temp_coeff = st.number_input("Temperature coefficient (1/C)", value=-0.00408, format="%.5f", help="Relative power loss per degree Celsius increase in cell temperature above the reference condition.")
-    pv_noct = st.number_input("NOCT (C)", min_value=0.0, value=46.0, step=1.0, help="Nominal Operating Cell Temperature from the PV module datasheet.")
-    pv_isc_temp_coeff = st.number_input("Isc temperature coefficient (1/C)", value=0.0005, format="%.5f", help="Relative short-circuit current change per degree Celsius.")
+    st.divider()
+    render_sidebar_card("Solar PV", "Configure array size, orientation, thermal behavior, and system losses.")
+    pv_col1, pv_col2 = st.columns(2)
+    pv_capacity_kwp = pv_col1.number_input("Array capacity (kWp)", min_value=0.0, value=100.0, step=10.0, help="Installed DC PV array size at standard test conditions.")
+    pv_noct = pv_col2.number_input("NOCT (C)", min_value=0.0, value=46.0, step=1.0, help="Nominal Operating Cell Temperature from the PV module datasheet.")
+    pv_temp_coeff = pv_col1.number_input("Temperature coefficient (1/C)", value=-0.00408, format="%.5f", help="Relative power loss per degree Celsius increase in cell temperature above the reference condition.")
+    pv_tilt_deg = pv_col2.number_input("Tilt angle (deg)", min_value=0.0, max_value=90.0, value=15.0, step=1.0, help="Panel tilt from horizontal. Adjust this for the actual site and mounting design.")
+    pv_azimuth_deg = pv_col1.number_input("Panel azimuth (deg)", min_value=0.0, max_value=360.0, value=0.0, step=5.0, help="Panel facing direction measured clockwise from north. Use 180 deg for south-facing arrays.")
+    pv_albedo = st.slider("Ground albedo", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Reflectivity of the ground surface used in the irradiance transposition model.")
     pv_losses = st.slider("System losses", min_value=0.0, max_value=0.5, value=0.15, step=0.01, help="Aggregate non-module PV losses such as wiring, mismatch, soiling, and DC collection losses.")
     pv_inverter_eff = st.slider("Inverter efficiency", min_value=0.5, max_value=1.0, value=0.96, step=0.01, help="Fraction of DC PV power converted to AC output.")
     st.caption("Enter the installed PV size and the main module/system performance assumptions from the datasheet.")
 
-    st.header("Wind Turbine Datasheet")
-    wind_capacity_kw = st.number_input("Rated power (kW)", min_value=0.0, value=0.0, step=10.0, help="Nameplate AC output of the wind turbine.")
-    wind_swept_area = st.number_input("Swept area (m^2)", min_value=1.0, value=397.6, step=1.0, help="Rotor swept area, usually available from the turbine datasheet.")
-    wind_hub_height = st.number_input("Hub height (m)", min_value=1.0, value=34.0, step=1.0, help="Height of the rotor hub above ground. This affects wind-speed extrapolation.")
-    wind_cut_in = st.number_input("Cut-in speed (m/s)", min_value=0.0, value=3.5, step=0.1, help="Minimum wind speed at which the turbine starts producing useful power.")
-    wind_rated_speed = st.number_input("Rated speed (m/s)", min_value=0.1, value=10.5, step=0.1, help="Wind speed at which the turbine reaches rated output.")
-    wind_cut_out = st.number_input("Cut-out speed (m/s)", min_value=0.1, value=20.0, step=0.1, help="Wind speed above which the turbine shuts down for protection.")
+    st.divider()
+    render_sidebar_card("Wind Turbine", "Use the turbine datasheet or power curve to define aerodynamic performance.")
+    wind_col1, wind_col2 = st.columns(2)
+    wind_capacity_kw = wind_col1.number_input("Rated power (kW)", min_value=0.0, value=0.0, step=10.0, help="Nameplate AC output of the wind turbine.")
+    wind_swept_area = wind_col2.number_input("Swept area (m^2)", min_value=1.0, value=397.6, step=1.0, help="Rotor swept area, usually available from the turbine datasheet.")
+    wind_hub_height = wind_col1.number_input("Hub height (m)", min_value=1.0, value=34.0, step=1.0, help="Height of the rotor hub above ground. This affects wind-speed extrapolation.")
+    wind_cut_in = wind_col2.number_input("Cut-in speed (m/s)", min_value=0.0, value=3.5, step=0.1, help="Minimum wind speed at which the turbine starts producing useful power.")
+    wind_rated_speed = wind_col1.number_input("Rated speed (m/s)", min_value=0.1, value=10.5, step=0.1, help="Wind speed at which the turbine reaches rated output.")
+    wind_cut_out = wind_col2.number_input("Cut-out speed (m/s)", min_value=0.1, value=20.0, step=0.1, help="Wind speed above which the turbine shuts down for protection.")
     st.caption("Use the turbine datasheet or power curve for these values, especially the cut-in, rated, and cut-out speeds.")
 
-    st.header("Hydropower Datasheet")
-    hydro_capacity_kw = st.number_input("Hydro rated power (kW)", min_value=0.0, value=0.0, step=10.0, help="Nameplate output of the hydropower plant or turbine.")
-    hydro_design_flow_m3s = st.number_input("Design flow (m^3/s)", min_value=0.0, value=1.0, step=0.1, help="Flow level the hydro turbine is designed to use at rated conditions.")
-    hydro_head_m = st.number_input("Net head (m)", min_value=0.0, value=20.0, step=1.0, help="Effective head at the turbine after hydraulic losses.")
+    st.divider()
+    render_sidebar_card("Hydropower", "Set plant size, hydraulic design, and environmental flow limits.")
+    hydro_col1, hydro_col2 = st.columns(2)
+    hydro_capacity_kw = hydro_col1.number_input("Hydro rated power (kW)", min_value=0.0, value=0.0, step=10.0, help="Nameplate output of the hydropower plant or turbine.")
+    hydro_design_flow_m3s = hydro_col2.number_input("Design flow (m^3/s)", min_value=0.0, value=1.0, step=0.1, help="Flow level the hydro turbine is designed to use at rated conditions.")
+    hydro_head_m = hydro_col1.number_input("Net head (m)", min_value=0.0, value=20.0, step=1.0, help="Effective head at the turbine after hydraulic losses.")
     hydro_efficiency = st.slider("Hydro efficiency", min_value=0.1, max_value=1.0, value=0.85, step=0.01, help="Overall turbine-generator conversion efficiency.")
     hydro_min_flow_fraction = st.slider("Hydro minimum flow fraction", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Minimum fraction of design flow needed before the hydro unit can operate.")
     hydro_environmental_flow_m3s = st.number_input("Environmental flow (m^3/s)", min_value=0.0, value=0.0, step=0.1, help="Flow that must remain in the river and cannot be diverted to generation.")
     st.caption("If you have a measured river-flow dataset, use it through the resource CSV path for a much more realistic hydro simulation.")
 
-    st.header("Diesel Generator Datasheet")
+    st.divider()
+    render_sidebar_card("Diesel Generator", "Set generator rating, fuel curve, and optional reliability behavior.")
     diesel_use_kva = st.toggle("Input diesel in kVA", value=True)
     if diesel_use_kva:
         diesel_capacity_kva = st.number_input("Generator rating (kVA)", min_value=0.0, value=60.0, step=5.0, help="Apparent power rating from the generator datasheet.")
@@ -352,35 +691,41 @@ with st.sidebar:
         diesel_capacity_kva = None
     diesel_pf = st.slider("Power factor", min_value=0.5, max_value=1.0, value=0.8, step=0.01, help="Used to convert kVA into kW when the generator is specified in apparent power.")
     diesel_min_load = st.slider("Minimum load fraction", min_value=0.0, max_value=1.0, value=0.25, step=0.01, help="Minimum stable loading fraction. Below this, real engines often operate poorly or should not run continuously.")
-    fuel_25 = st.number_input("Fuel use at 25% load (L/h)", min_value=0.0, value=4.5, step=0.1, help="Fuel use from the generator datasheet at 25% loading.")
-    fuel_50 = st.number_input("Fuel use at 50% load (L/h)", min_value=0.0, value=7.4, step=0.1, help="Fuel use from the generator datasheet at 50% loading.")
-    fuel_75 = st.number_input("Fuel use at 75% load (L/h)", min_value=0.0, value=11.0, step=0.1, help="Fuel use from the generator datasheet at 75% loading.")
-    fuel_100 = st.number_input("Fuel use at 100% load (L/h)", min_value=0.0, value=14.7, step=0.1, help="Fuel use from the generator datasheet at full load.")
+    fuel_col1, fuel_col2 = st.columns(2)
+    fuel_25 = fuel_col1.number_input("Fuel use at 25% load (L/h)", min_value=0.0, value=4.5, step=0.1, help="Fuel use from the generator datasheet at 25% loading.")
+    fuel_50 = fuel_col2.number_input("Fuel use at 50% load (L/h)", min_value=0.0, value=7.4, step=0.1, help="Fuel use from the generator datasheet at 50% loading.")
+    fuel_75 = fuel_col1.number_input("Fuel use at 75% load (L/h)", min_value=0.0, value=11.0, step=0.1, help="Fuel use from the generator datasheet at 75% loading.")
+    fuel_100 = fuel_col2.number_input("Fuel use at 100% load (L/h)", min_value=0.0, value=14.7, step=0.1, help="Fuel use from the generator datasheet at full load.")
     st.caption("Fuel values should come from the generator fuel-consumption table at different loading points.")
 
-    st.caption("Diesel Reliability")
-    enable_generator_reliability = st.toggle("Enable diesel reliability modeling", value=False, help="Adds planned maintenance and stochastic forced outages using MTBF and MTTR assumptions.")
-    mtbf_hours = st.number_input("Diesel MTBF (hours)", min_value=1.0, value=500.0, step=50.0, help="Average operating time between forced failures.")
-    mttr_hours = st.number_input("Diesel MTTR (hours)", min_value=1.0, value=8.0, step=1.0, help="Average repair duration after a forced outage.")
-    planned_maintenance_interval_hours = st.number_input("Planned maintenance interval (runtime-hours)", min_value=1.0, value=1000.0, step=100.0, help="Runtime interval between planned maintenance shutdowns.")
-    planned_maintenance_duration_hours = st.number_input("Planned maintenance duration (hours)", min_value=1.0, value=6.0, step=1.0, help="Length of each planned maintenance event.")
+    with st.expander("Advanced: Diesel Reliability", expanded=False):
+        enable_generator_reliability = st.toggle("Enable diesel reliability modeling", value=False, help="Adds planned maintenance and stochastic forced outages using MTBF and MTTR assumptions.")
+        rel_col1, rel_col2 = st.columns(2)
+        mtbf_hours = rel_col1.number_input("Diesel MTBF (hours)", min_value=1.0, value=500.0, step=50.0, help="Average operating time between forced failures.")
+        mttr_hours = rel_col2.number_input("Diesel MTTR (hours)", min_value=1.0, value=8.0, step=1.0, help="Average repair duration after a forced outage.")
+        planned_maintenance_interval_hours = rel_col1.number_input("Planned maintenance interval (runtime-hours)", min_value=1.0, value=1000.0, step=100.0, help="Runtime interval between planned maintenance shutdowns.")
+        planned_maintenance_duration_hours = rel_col2.number_input("Planned maintenance duration (hours)", min_value=1.0, value=6.0, step=1.0, help="Length of each planned maintenance event.")
 
-    st.header("Battery Datasheet")
-    battery_capacity_kwh = st.number_input("Energy capacity (kWh)", min_value=0.0, value=200.0, step=10.0, help="Total usable battery energy capacity.")
-    battery_power_kw = st.number_input("Power capacity (kW)", min_value=0.0, value=60.0, step=5.0, help="Maximum battery charge or discharge power.")
-    battery_voltage = st.number_input("Nominal voltage (V)", min_value=1.0, value=48.0, step=1.0, help="Nominal DC battery voltage used in the KiBaM formulation.")
+    st.divider()
+    render_sidebar_card("Battery", "Define storage size, efficiency, and degradation assumptions.")
+    batt_col1, batt_col2 = st.columns(2)
+    battery_capacity_kwh = batt_col1.number_input("Energy capacity (kWh)", min_value=0.0, value=200.0, step=10.0, help="Total usable battery energy capacity.")
+    battery_power_kw = batt_col2.number_input("Power capacity (kW)", min_value=0.0, value=60.0, step=5.0, help="Maximum battery charge or discharge power.")
+    battery_voltage = batt_col1.number_input("Nominal voltage (V)", min_value=1.0, value=48.0, step=1.0, help="Nominal DC battery voltage used in the KiBaM formulation.")
     battery_charge_eff = st.slider("Charge efficiency", min_value=0.5, max_value=1.0, value=0.93, step=0.01, help="Fraction of charging energy that is stored in the battery.")
     battery_discharge_eff = st.slider("Discharge efficiency", min_value=0.5, max_value=1.0, value=0.93, step=0.01, help="Fraction of stored energy that can be delivered back to the system.")
     battery_dod = st.slider("Max depth of discharge", min_value=0.1, max_value=1.0, value=0.80, step=0.01, help="Maximum share of the battery capacity that the controller is allowed to use.")
-    battery_k_rate = st.number_input("KiBaM k-rate (1/h)", min_value=0.0, value=0.1, step=0.01, format="%.2f", help="Charge transfer rate between available and bound charge reservoirs in the KiBaM battery model.")
+    battery_k_rate = batt_col2.number_input("KiBaM k-rate (1/h)", min_value=0.0, value=0.1, step=0.01, format="%.2f", help="Charge transfer rate between available and bound charge reservoirs in the KiBaM battery model.")
     battery_c_fraction = st.slider("Available charge fraction", min_value=0.05, max_value=0.95, value=0.30, step=0.01, help="Fraction of total battery charge that is immediately available in the KiBaM model.")
     battery_degradation_temp_sensitivity = st.number_input("Battery degradation temp sensitivity", min_value=0.0, value=0.025, step=0.005, format="%.3f", help="Multiplier that increases battery fade above 25 C.")
     battery_eol_fraction = st.slider("Battery end-of-life fraction", min_value=0.50, max_value=0.95, value=0.80, step=0.01, help="Battery replacement threshold as remaining capacity fraction.")
     st.caption("If you are unsure about `k-rate` or `available charge fraction`, keep the defaults unless you have calibration data.")
 
-    st.header("Load Inputs")
-    base_load_kw = st.number_input("Base load (kW)", min_value=0.0, value=40.0, step=5.0, help="Average demand anchor for the synthetic load generator.")
-    load_type = st.selectbox("Load type", ["residential", "commercial", "industrial"], help="Selects a built-in daily and weekly demand pattern when no measured load CSV is provided.")
+    st.divider()
+    render_sidebar_card("Load Inputs", "Describe demand level, variability, losses, and optional flexibility.")
+    load_col1, load_col2 = st.columns(2)
+    base_load_kw = load_col1.number_input("Base load (kW)", min_value=0.0, value=40.0, step=5.0, help="Average demand anchor for the synthetic load generator.")
+    load_type = load_col2.selectbox("Load type", ["residential", "commercial", "industrial"], help="Selects a built-in daily and weekly demand pattern when no measured load CSV is provided.")
     variability_std = st.slider("Load variability", min_value=0.0, max_value=0.3, value=0.08, step=0.01, help="Controls stochastic variability around the base synthetic demand pattern.")
     price_elasticity = st.slider("Load price elasticity", min_value=-1.0, max_value=0.0, value=0.0, step=0.05, help="Negative values reduce load when tariff multipliers rise.")
     tariff_multiplier = st.slider("Tariff multiplier", min_value=0.5, max_value=2.0, value=1.0, step=0.05, help="Relative retail tariff applied to the synthetic load model.")
@@ -388,55 +733,59 @@ with st.sidebar:
     non_technical_loss = st.slider("Non-technical loss", min_value=0.0, max_value=0.3, value=0.03, step=0.01, help="Commercial or non-metered losses added on top of useful load.")
     st.caption("These fields matter only when you are using the built-in synthetic load model instead of a measured load CSV.")
 
-    st.caption("Demand-Side Management")
-    enable_dsm = st.toggle("Enable DSM", value=False, help="Applies simple load shifting and peak shaving to make demand more flexible.")
-    deferrable_load_fraction = st.slider("Deferrable load fraction", min_value=0.0, max_value=0.6, value=0.15, step=0.01, help="Share of peak-period demand that can be shifted to another time window.")
-    peak_reduction_fraction = st.slider("Peak reduction fraction", min_value=0.0, max_value=0.5, value=0.05, step=0.01, help="Additional peak-period demand that is curtailed rather than shifted.")
-    peak_start_hour = st.slider("Peak start hour", min_value=0, max_value=23, value=18, step=1, help="Start of the demand peak window used by DSM.")
-    peak_end_hour = st.slider("Peak end hour", min_value=1, max_value=24, value=22, step=1, help="End of the demand peak window used by DSM.")
-    shift_start_hour = st.slider("Shift-to start hour", min_value=0, max_value=23, value=10, step=1, help="Start of the preferred window that receives shifted demand.")
-    shift_end_hour = st.slider("Shift-to end hour", min_value=1, max_value=24, value=16, step=1, help="End of the preferred load-shifting window.")
+    with st.expander("Advanced: Demand-Side Management", expanded=False):
+        enable_dsm = st.toggle("Enable DSM", value=False, help="Applies simple load shifting and peak shaving to make demand more flexible.")
+        deferrable_load_fraction = st.slider("Deferrable load fraction", min_value=0.0, max_value=0.6, value=0.15, step=0.01, help="Share of peak-period demand that can be shifted to another time window.")
+        peak_reduction_fraction = st.slider("Peak reduction fraction", min_value=0.0, max_value=0.5, value=0.05, step=0.01, help="Additional peak-period demand that is curtailed rather than shifted.")
+        dsm_col1, dsm_col2 = st.columns(2)
+        peak_start_hour = dsm_col1.slider("Peak start hour", min_value=0, max_value=23, value=18, step=1, help="Start of the demand peak window used by DSM.")
+        peak_end_hour = dsm_col2.slider("Peak end hour", min_value=1, max_value=24, value=22, step=1, help="End of the demand peak window used by DSM.")
+        shift_start_hour = dsm_col1.slider("Shift-to start hour", min_value=0, max_value=23, value=10, step=1, help="Start of the preferred window that receives shifted demand.")
+        shift_end_hour = dsm_col2.slider("Shift-to end hour", min_value=1, max_value=24, value=16, step=1, help="End of the preferred load-shifting window.")
 
-    st.header("Economics")
-    project_lifetime_years = st.slider("Project life (years)", min_value=1, max_value=30, value=20, help="Years included in the lifecycle cost and LCOE calculation.")
-    nominal_discount_rate = st.slider("Discount rate", min_value=0.0, max_value=0.3, value=0.12, step=0.01, help="Nominal discount rate used to bring future costs and energy to present value.")
-    fuel_price_per_liter = st.number_input("Fuel price ($/L)", min_value=0.0, value=1.50, step=0.05, help="Current diesel fuel price used in dispatch and lifecycle economics.")
+    st.divider()
+    render_sidebar_card("Economics and Risk", "Review tariff, CAPEX, O&M, financing, and uncertainty assumptions.")
+    econ_col1, econ_col2 = st.columns(2)
+    project_lifetime_years = econ_col1.slider("Project life (years)", min_value=1, max_value=30, value=20, help="Years included in the lifecycle cost and LCOE calculation.")
+    nominal_discount_rate = econ_col2.slider("Discount rate", min_value=0.0, max_value=0.3, value=0.12, step=0.01, help="Nominal discount rate used to bring future costs and energy to present value.")
+    fuel_price_per_liter = econ_col1.number_input("Fuel price ($/L)", min_value=0.0, value=1.50, step=0.05, help="Current diesel fuel price used in dispatch and lifecycle economics.")
     fuel_price_escalation_rate = st.slider("Fuel price escalation", min_value=0.0, max_value=0.2, value=0.05, step=0.01, help="Expected annual growth in fuel price over the project lifetime.")
     om_escalation_rate = st.slider("O&M escalation", min_value=0.0, max_value=0.2, value=0.03, step=0.01, help="Expected annual increase in operations and maintenance costs.")
-    energy_tariff_per_kwh = st.number_input("Energy tariff ($/kWh)", min_value=0.0, value=0.30, step=0.01, help="Average revenue tariff used for DSCR and project cash flow.")
+    energy_tariff_per_kwh = econ_col2.number_input("Energy tariff ($/kWh)", min_value=0.0, value=0.75, step=0.01, help="Average revenue tariff used for DSCR and project cash flow.")
     tariff_escalation_rate = st.slider("Tariff escalation", min_value=0.0, max_value=0.2, value=0.03, step=0.01, help="Expected annual growth in retail tariff.")
     unserved_energy_cost_per_kwh = st.number_input("Unserved energy penalty ($/kWh)", min_value=0.0, value=2.0, step=0.1, help="Economic penalty assigned to each kWh of unmet demand.")
     st.caption("These values drive lifecycle cost and LCOE, so use assumptions that match your project finance context.")
 
-    st.caption("Capital Cost Assumptions")
-    pv_capex_per_kwp = st.number_input("PV CAPEX ($/kWp)", min_value=0.0, value=900.0, step=25.0, help="Installed capital cost per kWp of PV.")
-    wind_capex_per_kw = st.number_input("Wind CAPEX ($/kW)", min_value=0.0, value=1500.0, step=50.0, help="Installed capital cost per kW of wind capacity.")
-    hydro_capex_per_kw = st.number_input("Hydro CAPEX ($/kW)", min_value=0.0, value=2500.0, step=50.0, help="Installed capital cost per kW of hydropower capacity.")
-    diesel_capex_per_kw = st.number_input("Diesel CAPEX ($/kW)", min_value=0.0, value=550.0, step=25.0, help="Installed capital cost per kW of diesel generator capacity.")
-    battery_capex_per_kwh = st.number_input("Battery CAPEX ($/kWh)", min_value=0.0, value=350.0, step=10.0, help="Installed battery energy cost per kWh.")
-    battery_power_capex_per_kw = st.number_input("Battery power CAPEX ($/kW)", min_value=0.0, value=150.0, step=10.0, help="Additional battery power electronics and converter cost per kW.")
+    with st.expander("Advanced: Capital Cost Assumptions", expanded=False):
+        capex_col1, capex_col2 = st.columns(2)
+        pv_capex_per_kwp = capex_col1.number_input("PV CAPEX ($/kWp)", min_value=0.0, value=900.0, step=25.0, help="Installed capital cost per kWp of PV.")
+        wind_capex_per_kw = capex_col2.number_input("Wind CAPEX ($/kW)", min_value=0.0, value=1500.0, step=50.0, help="Installed capital cost per kW of wind capacity.")
+        hydro_capex_per_kw = capex_col1.number_input("Hydro CAPEX ($/kW)", min_value=0.0, value=2500.0, step=50.0, help="Installed capital cost per kW of hydropower capacity.")
+        diesel_capex_per_kw = capex_col2.number_input("Diesel CAPEX ($/kW)", min_value=0.0, value=550.0, step=25.0, help="Installed capital cost per kW of diesel generator capacity.")
+        battery_capex_per_kwh = capex_col1.number_input("Battery CAPEX ($/kWh)", min_value=0.0, value=350.0, step=10.0, help="Installed battery energy cost per kWh.")
+        battery_power_capex_per_kw = capex_col2.number_input("Battery power CAPEX ($/kW)", min_value=0.0, value=150.0, step=10.0, help="Additional battery power electronics and converter cost per kW.")
 
-    st.caption("Annual O&M Assumptions")
-    pv_fixed_om_per_kw_year = st.number_input("PV fixed O&M ($/kW-yr)", min_value=0.0, value=18.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of PV.")
-    wind_fixed_om_per_kw_year = st.number_input("Wind fixed O&M ($/kW-yr)", min_value=0.0, value=45.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of wind.")
-    hydro_fixed_om_per_kw_year = st.number_input("Hydro fixed O&M ($/kW-yr)", min_value=0.0, value=35.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of hydropower.")
-    diesel_fixed_om_per_kw_year = st.number_input("Diesel fixed O&M ($/kW-yr)", min_value=0.0, value=20.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of diesel capacity.")
-    diesel_maintenance_cost_per_hour = st.number_input("Diesel maintenance ($/runtime-hour)", min_value=0.0, value=1.5, step=0.1, help="Maintenance cost applied to each generator runtime hour.")
-    battery_fixed_om_per_kwh_year = st.number_input("Battery fixed O&M ($/kWh-yr)", min_value=0.0, value=8.0, step=1.0, help="Annual fixed operations and maintenance cost per kWh of installed battery energy.")
-    diesel_variable_om_per_kwh = st.number_input("Diesel variable O&M ($/kWh)", min_value=0.0, value=0.03, step=0.01, format="%.2f", help="Variable cost applied to each kWh produced by the diesel generator.")
-    battery_variable_om_per_kwh = st.number_input("Battery variable O&M ($/kWh)", min_value=0.0, value=0.01, step=0.01, format="%.2f", help="Variable cost applied to each kWh discharged from the battery.")
-    st.caption("CAPEX is paid up front. Fixed O&M is yearly. Variable O&M scales with energy produced or discharged.")
+    with st.expander("Advanced: O&M, Debt and Risk", expanded=False):
+        om_col1, om_col2 = st.columns(2)
+        pv_fixed_om_per_kw_year = om_col1.number_input("PV fixed O&M ($/kW-yr)", min_value=0.0, value=18.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of PV.")
+        wind_fixed_om_per_kw_year = om_col2.number_input("Wind fixed O&M ($/kW-yr)", min_value=0.0, value=45.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of wind.")
+        hydro_fixed_om_per_kw_year = om_col1.number_input("Hydro fixed O&M ($/kW-yr)", min_value=0.0, value=35.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of hydropower.")
+        diesel_fixed_om_per_kw_year = om_col2.number_input("Diesel fixed O&M ($/kW-yr)", min_value=0.0, value=20.0, step=1.0, help="Annual fixed operations and maintenance cost per kW of diesel capacity.")
+        diesel_maintenance_cost_per_hour = om_col1.number_input("Diesel maintenance ($/runtime-hour)", min_value=0.0, value=1.5, step=0.1, help="Maintenance cost applied to each generator runtime hour.")
+        battery_fixed_om_per_kwh_year = om_col2.number_input("Battery fixed O&M ($/kWh-yr)", min_value=0.0, value=8.0, step=1.0, help="Annual fixed operations and maintenance cost per kWh of installed battery energy.")
+        diesel_variable_om_per_kwh = om_col1.number_input("Diesel variable O&M ($/kWh)", min_value=0.0, value=0.03, step=0.01, format="%.2f", help="Variable cost applied to each kWh produced by the diesel generator.")
+        battery_variable_om_per_kwh = om_col2.number_input("Battery variable O&M ($/kWh)", min_value=0.0, value=0.01, step=0.01, format="%.2f", help="Variable cost applied to each kWh discharged from the battery.")
+        debt_fraction = st.slider("Debt fraction", min_value=0.0, max_value=0.95, value=0.70, step=0.05, help="Share of upfront CAPEX financed by debt.")
+        debt_interest_rate = st.slider("Debt interest rate", min_value=0.0, max_value=0.25, value=0.10, step=0.01, help="Nominal annual debt interest rate.")
+        debt_tenor_years = st.slider("Debt tenor (years)", min_value=1, max_value=20, value=10, help="Years over which the model repays debt.")
+        monte_carlo_runs = st.slider("Monte Carlo runs", min_value=0, max_value=1000, value=200, step=50, help="Number of stochastic finance scenarios used for risk outputs.")
+        risk_col1, risk_col2 = st.columns(2)
+        fuel_price_volatility = risk_col1.slider("Fuel price volatility", min_value=0.0, max_value=0.6, value=0.18, step=0.01, help="Annualized fuel price volatility used in the GBM process.")
+        inflation_volatility = risk_col2.slider("Inflation volatility", min_value=0.0, max_value=0.2, value=0.02, step=0.005, help="Shock size for annual CPI in the AR(1) process.")
+        exchange_rate_volatility = risk_col1.slider("FX volatility", min_value=0.0, max_value=0.4, value=0.08, step=0.01, help="Shock size for annual FX in the AR(1) process.")
 
-    st.caption("Debt and Risk")
-    debt_fraction = st.slider("Debt fraction", min_value=0.0, max_value=0.95, value=0.70, step=0.05, help="Share of upfront CAPEX financed by debt.")
-    debt_interest_rate = st.slider("Debt interest rate", min_value=0.0, max_value=0.25, value=0.10, step=0.01, help="Nominal annual debt interest rate.")
-    debt_tenor_years = st.slider("Debt tenor (years)", min_value=1, max_value=20, value=10, help="Years over which the model repays debt.")
-    monte_carlo_runs = st.slider("Monte Carlo runs", min_value=0, max_value=1000, value=200, step=50, help="Number of stochastic finance scenarios used for risk outputs.")
-    fuel_price_volatility = st.slider("Fuel price volatility", min_value=0.0, max_value=0.6, value=0.18, step=0.01, help="Annualized fuel price volatility used in the GBM process.")
-    inflation_volatility = st.slider("Inflation volatility", min_value=0.0, max_value=0.2, value=0.02, step=0.005, help="Shock size for annual CPI in the AR(1) process.")
-    exchange_rate_volatility = st.slider("FX volatility", min_value=0.0, max_value=0.4, value=0.08, step=0.01, help="Shock size for annual FX in the AR(1) process.")
-
-    st.header("Visual Range")
+    st.divider()
+    render_sidebar_card("Visual Range", "Choose how much of the simulation period to show in the dashboard plots.")
     days_to_plot = st.slider("Days to show in time-series plots", min_value=1, max_value=max(1, num_days), value=min(14, num_days), help="How much of the simulated period to show in the time-series charts.")
 
     run_simulation = st.button("Run Simulation", type="primary", use_container_width=True)
@@ -460,16 +809,18 @@ if run_simulation:
             battery_power_kw=battery_power_kw,
             base_load_kw=base_load_kw,
             load_type=load_type,
-            load_profile_file=load_profile_file or None,
-            resource_profile_file=resource_profile_file or None,
+            load_profile_file=effective_load_profile_file,
+            resource_profile_file=effective_resource_profile_file,
             dispatch_strategy=dispatch_strategy,
             random_seed=int(random_seed),
             pv_params={
                 "temp_coeff_power": pv_temp_coeff,
                 "noct": pv_noct,
+                "tilt_deg": pv_tilt_deg,
+                "panel_azimuth_deg": pv_azimuth_deg,
+                "albedo": pv_albedo,
                 "system_losses": pv_losses,
                 "inverter_efficiency": pv_inverter_eff,
-                "isc_temp_coeff_rel": pv_isc_temp_coeff,
             },
             wind_params={
                 "rated_power_kw": wind_capacity_kw,
@@ -564,52 +915,121 @@ if run_simulation:
         monte_carlo_df = sim.monte_carlo_summary
         monte_carlo_samples_df = sim.monte_carlo_samples
         interpretations, recommendations = build_interpretation(metrics)
+        model_notes, validation_checks, limitations = build_model_use_notes(
+            metrics,
+            has_resource_profile=bool(effective_resource_profile_file),
+            has_load_profile=bool(effective_load_profile_file),
+        )
+        financeability_level, financeability_message = build_financeability_message(metrics)
 
     st.success("Simulation complete.")
 
+    st.subheader("Headline KPIs")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Load Served", f"{metrics['load_served_fraction']:.1%}")
+    render_kpi_card(
+        col1,
+        "Load Served",
+        f"{metrics['load_served_fraction']:.1%}",
+        get_load_served_kpi_class(metrics["load_served_fraction"]),
+    )
     col2.metric("Renewable Fraction", f"{metrics['renewable_fraction']:.1%}")
     col3.metric("Fuel Used", f"{metrics['total_fuel_liters']:.1f} L")
-    col4.metric("LCOE", f"${metrics['lcoe']:.3f}/kWh")
+    render_kpi_card(
+        col4,
+        "LCOE",
+        f"${metrics['lcoe']:.3f}/kWh",
+        get_lcoe_kpi_class(metrics["lcoe"]),
+    )
 
     col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Total Load", f"{metrics['total_load_kwh']:,.0f} kWh")
-    col6.metric("Load Shedding", f"{metrics['total_load_shedding_kwh']:,.1f} kWh")
-    col7.metric("Avg Battery SOC", f"{metrics['average_battery_soc']:.1f}%")
-    col8.metric("Diesel Runtime", f"{metrics['diesel_runtime_hours']:.1f} h")
+    col5.metric("Avg Battery SOC", f"{metrics['average_battery_soc']:.1f}%")
+    col6.metric("Diesel Runtime", f"{metrics['diesel_runtime_hours']:.1f} h")
+    render_kpi_card(
+        col7,
+        "Min DSCR",
+        f"{metrics['minimum_dscr']:.2f}" if pd.notna(metrics["minimum_dscr"]) else "N/A",
+        get_dscr_kpi_class(metrics["minimum_dscr"]),
+    )
+    col8.metric("Resource Mode", metrics["resource_data_mode"].replace("_", " ").title())
 
-    col9, col10, col11, col12 = st.columns(4)
-    col9.metric("Upfront CAPEX", f"${metrics['upfront_capex']:,.0f}")
-    col10.metric("Lifecycle Cost (NPV)", f"${metrics['discounted_lifecycle_cost']:,.0f}")
-    col11.metric("Operating Cost/kWh", f"${metrics['operating_cost_per_kwh_served']:.3f}/kWh")
-    col12.metric("Battery Replace Interval", f"{metrics['battery_replacement_interval_years']:.1f} yr")
+    if financeability_level == "success":
+        st.success(financeability_message)
+    elif financeability_level == "warning":
+        st.warning(financeability_message)
+    elif financeability_level == "error":
+        st.error(financeability_message)
+    else:
+        st.info(financeability_message)
 
-    col13, col14, col15, col16 = st.columns(4)
-    col13.metric("Min DSCR", f"{metrics['minimum_dscr']:.2f}" if pd.notna(metrics["minimum_dscr"]) else "N/A")
-    col14.metric("Avg DSCR", f"{metrics['average_dscr']:.2f}" if pd.notna(metrics["average_dscr"]) else "N/A")
-    col15.metric("Diesel Availability", f"{metrics['diesel_availability_fraction']:.1%}")
-    col16.metric("DSM Shifted Energy", f"{metrics['total_dsm_shifted_energy_kwh']:,.1f} kWh")
+    st.subheader("Visual Summary")
+    vis_left, vis_right = st.columns([1, 1])
+    with vis_left:
+        st.pyplot(build_served_load_breakdown_figure(metrics), use_container_width=True)
+        st.pyplot(build_energy_mix_figure(metrics), use_container_width=True)
+    with vis_right:
+        st.pyplot(build_resource_quality_figure(metrics), use_container_width=True)
+        st.pyplot(build_financial_risk_figure(metrics), use_container_width=True)
 
-    col17, col18, col19, col20 = st.columns(4)
-    col17.metric("LCOE P50", f"${metrics['lcoe_p50']:.3f}/kWh" if pd.notna(metrics["lcoe_p50"]) else "N/A")
-    col18.metric("LCOE P90", f"${metrics['lcoe_p90']:.3f}/kWh" if pd.notna(metrics["lcoe_p90"]) else "N/A")
-    col19.metric("Peak Load Before DSM", f"{metrics['peak_baseline_load_kw']:.1f} kW")
-    col20.metric("Peak Load After DSM", f"{metrics['peak_load_kw']:.1f} kW")
-
-    st.subheader("Interpretation and Recommendations")
-    summary_left, summary_right = st.columns(2)
-    with summary_left:
-        st.markdown("**Interpretation**")
-        for item in interpretations:
-            st.write(f"- {item}")
-    with summary_right:
-        st.markdown("**Recommended actions**")
-        if recommendations:
-            for item in recommendations:
-                st.write(f"- {item}")
-        else:
-            st.write("- The results look broadly balanced. Use scenario comparison to confirm whether this is your preferred design.")
+    st.subheader("Key Supporting Metrics")
+    metric_table_left, metric_table_right = st.columns([1, 1])
+    with metric_table_left:
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Metric": [
+                        "Total load (kWh)",
+                        "Load shedding (kWh)",
+                        "Peak load after DSM (kW)",
+                        "Peak load before DSM (kW)",
+                        "Diesel availability",
+                        "Battery replacement interval (yr)",
+                        "PV specific yield (kWh/kWp-yr)",
+                        "Solar capacity factor",
+                    ],
+                    "Value": [
+                        round(metrics["total_load_kwh"], 1),
+                        round(metrics["total_load_shedding_kwh"], 1),
+                        round(metrics["peak_load_kw"], 2),
+                        round(metrics["peak_baseline_load_kw"], 2),
+                        f"{metrics['diesel_availability_fraction']:.1%}",
+                        round(metrics["battery_replacement_interval_years"], 2),
+                        round(metrics["pv_specific_yield_kwh_per_kwp_year"], 1),
+                        f"{metrics['solar_capacity_factor']:.1%}",
+                    ],
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with metric_table_right:
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Metric": [
+                        "Upfront CAPEX ($)",
+                        "Lifecycle cost NPV ($)",
+                        "Operating cost per kWh ($/kWh)",
+                        "LCOE P50 ($/kWh)",
+                        "LCOE P90 ($/kWh)",
+                        "Curtailment (kWh)",
+                        "DSM shifted energy (kWh)",
+                        "Energy balance error (kWh)",
+                    ],
+                    "Value": [
+                        round(metrics["upfront_capex"], 2),
+                        round(metrics["discounted_lifecycle_cost"], 2),
+                        round(metrics["operating_cost_per_kwh_served"], 4),
+                        round(metrics["lcoe_p50"], 4) if pd.notna(metrics["lcoe_p50"]) else "N/A",
+                        round(metrics["lcoe_p90"], 4) if pd.notna(metrics["lcoe_p90"]) else "N/A",
+                        round(metrics["total_curtailment_kwh"], 1),
+                        round(metrics["total_dsm_shifted_energy_kwh"], 1),
+                        round(metrics["absolute_energy_balance_error_kwh"], 6),
+                    ],
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Visuals", "Results Table", "Economics", "Risk", "Downloads"])
 
@@ -626,7 +1046,7 @@ if run_simulation:
                 use_container_width=True,
             )
         with right:
-            st.pyplot(build_energy_mix_figure(metrics), use_container_width=True)
+            st.pyplot(build_generation_totals_figure(metrics), use_container_width=True)
             st.dataframe(
                 pd.DataFrame(
                     {
@@ -767,6 +1187,33 @@ if run_simulation:
                 file_name="microgrid_monte_carlo_samples.csv",
                 mime="text/csv",
             )
+
+    st.subheader("Interpretation and Recommendations")
+    summary_left, summary_right = st.columns(2)
+    with summary_left:
+        st.markdown("**Interpretation**")
+        for item in interpretations:
+            st.write(f"- {item}")
+    with summary_right:
+        st.markdown("**Recommended actions**")
+        if recommendations:
+            for item in recommendations:
+                st.write(f"- {item}")
+        else:
+            st.write("- The results look broadly balanced. Use scenario comparison to confirm whether this is your preferred design.")
+
+    with st.expander("Using Your Model: Presentation Notes", expanded=False):
+        st.markdown("**Key points to report**")
+        for item in model_notes:
+            st.write(f"- {item}")
+
+        st.markdown("**Validation and sensitivity checklist**")
+        for item in validation_checks:
+            st.write(f"- {item}")
+
+        st.markdown("**Limitations to state clearly**")
+        for item in limitations:
+            st.write(f"- {item}")
 
 else:
     st.info("Set the component datasheet values in the sidebar, then click Run Simulation.")

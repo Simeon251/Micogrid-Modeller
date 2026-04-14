@@ -134,20 +134,17 @@ class MicrogridSimulation:
         if diesel_capacity_kva is not None:
             diesel_capacity_kw = diesel_capacity_kva * diesel_power_factor
 
-        pv_model_overrides = {}
-        if pv_params:
-            pv_model_overrides = {
-                key: pv_params[key]
-                for key in ['isc_temp_coeff_rel']
-                if key in pv_params
-            }
-
         pv_config = {'array_capacity_kwp': pv_capacity_kwp}
         if pv_params:
-            pv_config.update({k: v for k, v in pv_params.items() if k not in pv_model_overrides})
+            pv_config.update({
+                k: v for k, v in pv_params.items()
+                if k not in {'tilt_deg', 'panel_azimuth_deg', 'albedo', 'isc_temp_coeff_rel'}
+            })
         self.pv_gen = PVGenerator(**pv_config)
         self.pv_model_params = {
-            'isc_temp_coeff_rel': pv_model_overrides.get('isc_temp_coeff_rel', 0.0005)
+            'tilt_deg': (pv_params or {}).get('tilt_deg', max(10.0, min(abs(self.location_lat), 35.0))),
+            'panel_azimuth_deg': (pv_params or {}).get('panel_azimuth_deg', 180.0 if self.location_lat >= 0 else 0.0),
+            'albedo': (pv_params or {}).get('albedo', 0.2),
         }
 
         wind_config = {'rated_power_kw': wind_capacity_kw}
@@ -257,6 +254,7 @@ class MicrogridSimulation:
         self.monte_carlo_summary = pd.DataFrame()
         self.monte_carlo_samples = pd.DataFrame()
         self.battery_renewable_energy_kwh = 0.0
+        self.resource_data_mode = 'synthetic_profiles'
 
     def _build_economic_params(self, overrides=None):
         """Build lifecycle economics assumptions with user overrides."""
@@ -273,7 +271,7 @@ class MicrogridSimulation:
             'fuel_price_per_liter': 1.50,
             'fuel_price_escalation_rate': 0.05,
             'fuel_price_volatility': 0.18,
-            'energy_tariff_per_kwh': 0.30,
+            'energy_tariff_per_kwh': 0.75,
             'tariff_escalation_rate': 0.03,
             'pv_capex_per_kwp': 900.0,
             'wind_capex_per_kw': 1500.0,
@@ -864,20 +862,20 @@ class MicrogridSimulation:
             ])
             if ghi_col is not None:
                 irradiance = resource_df[ghi_col].astype(float).to_numpy()
+                self.resource_data_mode = 'measured_resource_profile'
                 print(f"  + Solar irradiance loaded from profile: {ghi_col}")
                 print(f"  + Solar irradiance mean: {np.mean(irradiance):.1f} W/m2")
                 print(f"  + Solar irradiance max: {np.max(irradiance):.1f} W/m2")
                 return irradiance
 
-        latitude_scale = min(abs(self.location_lat) / 45.0, 1.0)
-        seasonal_bias = -0.02 * latitude_scale if self.location_lat >= 0 else 0.02 * latitude_scale
-        monthly_kt = np.clip(np.array([
-            0.545, 0.562, 0.553, 0.560, 0.559, 0.591,
-            0.581, 0.559, 0.566, 0.545, 0.536, 0.535
-        ]) + seasonal_bias, 0.35, 0.75)
-
-        sim = SolarResourceSimulator(lat=self.location_lat, lon=self.location_lon)
-        hourly_irradiance = np.array(sim.run_full_year(monthly_kt.tolist()))
+        self.resource_data_mode = 'synthetic_profiles'
+        sim = SolarResourceSimulator(
+            lat=self.location_lat,
+            lon=self.location_lon,
+            random_seed=self.random_seed,
+        )
+        monthly_kt = sim.estimate_monthly_kt()
+        hourly_irradiance = np.array(sim.run_full_year(monthly_kt.tolist(), year=self.start_date.year))
 
         # Resample to match the simulation timestep if not hourly
         if self.timestep_minutes != 60:
@@ -1024,17 +1022,16 @@ class MicrogridSimulation:
 
         # Synthetic daily extrema before hourly reconstruction.
         hemisphere_shift = 0 if self.location_lat >= 0 else 182
-        latitude_temp_offset = -0.12 * abs(self.location_lat)
-        daily_tmin = (
-            12 + latitude_temp_offset +
-            6 * np.sin((day_of_year - 110 - hemisphere_shift) * 2 * np.pi / 365) +
-            np.random.normal(0, 1.0, len(days))
+        latitude_scale = min(abs(self.location_lat) / 45.0, 1.0)
+        mean_temp_c = 22.0 - 0.18 * abs(self.location_lat)
+        seasonal_amplitude_c = 1.0 + 5.0 * latitude_scale
+        diurnal_range_c = 8.0 + 2.0 * latitude_scale
+        seasonal_component = seasonal_amplitude_c * np.sin(
+            (day_of_year - 110 - hemisphere_shift) * 2 * np.pi / 365
         )
-        daily_tmax = (
-            daily_tmin + 8 +
-            3 * np.sin((day_of_year - 80 - hemisphere_shift) * 2 * np.pi / 365) +
-            np.random.normal(0, 1.0, len(days))
-        )
+        daily_mean = mean_temp_c + seasonal_component + np.random.normal(0, 0.8, len(days))
+        daily_tmin = daily_mean - diurnal_range_c / 2.0 + np.random.normal(0, 0.6, len(days))
+        daily_tmax = daily_mean + diurnal_range_c / 2.0 + np.random.normal(0, 0.6, len(days))
         daily_tmax = np.maximum(daily_tmax, daily_tmin + 1.0)
 
         temperature = self._dumortier_hourly_temperature(daily_tmin, daily_tmax)
@@ -1219,7 +1216,14 @@ class MicrogridSimulation:
                 ghi_w_m2=solar_irradiance[step],
                 ambient_temp_c=temperature[step],
                 system_size_w=self.pv_gen.array_capacity_kwp * 1000.0,
-                isc_temp_coeff_rel=self.pv_model_params['isc_temp_coeff_rel']
+                latitude_deg=self.location_lat,
+                tilt_deg=self.pv_model_params['tilt_deg'],
+                panel_azimuth_deg=self.pv_model_params['panel_azimuth_deg'],
+                albedo=self.pv_model_params['albedo'],
+                temp_coeff_power=self.pv_gen.temp_coeff_power,
+                noct_c=self.pv_gen.noct,
+                system_losses=self.pv_gen.system_losses,
+                inverter_efficiency=self.pv_gen.inverter_efficiency,
             )
             solar_kw = pv_state['pv_power_w'] / 1000.0
             
@@ -1423,7 +1427,9 @@ class MicrogridSimulation:
         metrics['total_battery_throughput_kwh'] = self.battery.total_throughput_mwh * 1000.0
         metrics['total_generation_kwh'] = results_df['total_generation_kw'].sum() * self.timestep_hours
         metrics['total_supply_kwh'] = results_df['total_supply_kw'].sum() * self.timestep_hours
-        
+        metrics['total_curtailment_kwh'] = results_df['curtailment_kw'].sum() * self.timestep_hours
+        metrics['absolute_energy_balance_error_kwh'] = results_df['power_balance_kw'].abs().sum() * self.timestep_hours
+
         metrics['total_baseline_load_kwh'] = results_df['baseline_load_kw'].sum() * self.timestep_hours
         metrics['total_load_kwh'] = results_df['load_kw'].sum() * self.timestep_hours
         metrics['total_load_served_kwh'] = results_df['load_served_kw'].sum() * self.timestep_hours
@@ -1450,7 +1456,8 @@ class MicrogridSimulation:
         metrics['diesel_planned_outage_events'] = self.diesel_planned_outage_events
         metrics['load_served_fraction'] = (metrics['total_load_served_kwh'] / 
                                           (metrics['total_load_kwh'] + 1e-6))
-        
+        metrics['resource_data_mode'] = self.resource_data_mode
+
         # Renewable metrics
         total_renewable = (metrics['total_solar_generation_kwh'] + 
                           metrics['total_wind_generation_kwh'] +
@@ -1487,6 +1494,17 @@ class MicrogridSimulation:
         metrics['average_solar_kw'] = results_df['solar_generation_kw'].mean()
         metrics['average_wind_kw'] = results_df['wind_generation_kw'].mean()
         metrics['average_hydro_kw'] = results_df['hydro_generation_kw'].mean()
+        metrics['pv_specific_yield_kwh_per_kwp_year'] = (
+            self._annualize_value(metrics['total_solar_generation_kwh']) / max(self.pv_gen.array_capacity_kwp, 1e-6)
+        )
+        metrics['solar_capacity_factor'] = (
+            self._annualize_value(metrics['total_solar_generation_kwh'])
+            / max(self.pv_gen.array_capacity_kwp * 8760.0, 1e-6)
+        )
+        metrics['diesel_capacity_factor'] = (
+            self._annualize_value(metrics['total_diesel_generation_kwh'])
+            / max(self.diesel_gen.rated_kw * 8760.0, 1e-6)
+        )
 
         annual_metrics = {}
         for key in [

@@ -1,6 +1,6 @@
 # MicroGridModeler
 
-MicroGridModeler is a user-facing microgrid design tool. A user can enter datasheet values for the currently implemented sources and storage systems, run the simulation, and review the output through clearer visuals and downloadable result tables. The simulator now includes lifecycle project economics with CAPEX, O&M, replacement scheduling, fuel-price escalation, discounted cash flow, and LCOE reporting. It also supports optional timestamped meteorological/resource CSV inputs and a hydropower plant model. The codebase is organized so other energy sources can be added later.
+MicroGridModeler is a user-facing microgrid design tool. A user can enter datasheet values for the currently implemented sources and storage systems, run the simulation, and review the output through clearer visuals and downloadable result tables. The simulator includes lifecycle project economics with CAPEX, O&M, replacement scheduling, fuel-price escalation, discounted cash flow, DSCR, Monte Carlo risk outputs, and LCOE reporting. It also supports optional timestamped meteorological/resource CSV inputs and a hydropower plant model. The codebase is organized so other energy sources can be added later.
 
 ## Main Files
 - `streamlit_app.py` - Streamlit interface for entering datasheet values and viewing outputs
@@ -12,6 +12,10 @@ MicroGridModeler is a user-facing microgrid design tool. A user can enter datash
 - `solar_resource_model.py` - solar resource generation
 - `solar_pv_model.py` - PV performance calculations
 
+## Site Flexibility
+- The synthetic resource model is no longer tied to Kigali. Latitude, longitude, PV tilt, PV azimuth, and ground albedo can be changed for other markets and project sites.
+- When a measured resource CSV is available, it should be preferred over synthetic weather for validation and decision support.
+
 ## Economic Outputs
 - Upfront CAPEX
 - Operating cost per kWh served
@@ -19,6 +23,8 @@ MicroGridModeler is a user-facing microgrid design tool. A user can enter datash
 - LCOE
 - Replacement schedule cash flow
 - Fuel use and outage-penalty costs
+- DSCR summary
+- Monte Carlo P50 and P90 outputs for key finance metrics
 
 ## Resource CSV Inputs
 You can optionally point the app to a timestamped resource CSV. Supported column names include:
@@ -31,6 +37,12 @@ You can optionally point the app to a timestamped resource CSV. Supported column
 - `load_kw`
 
 If one of these columns is missing, the simulator falls back to its internal synthetic model for that variable.
+
+## Presentation Guidance
+- Use scenario analysis to compare alternative system designs instead of presenting only one base case.
+- Use sensitivity analysis for fuel price, tariff, load growth, PV output, and storage size.
+- Validate against measured load/resource data when possible, and state clearly when synthetic profiles are being used.
+- Report model limitations explicitly, especially for early-stage screening cases without measured input data.
 
 ## Run The Streamlit App
 ```bash

@@ -41,8 +41,8 @@ class LeadAcidBattery:
                  max_depth_of_discharge=0.80,
                  temperature_coefficient=-0.003,  # -0.3% per °C deviation from 25°C
                  peukert_exponent=1.24,  # Typical for lead-acid
-                 calendar_fade_rate=0.0003,  # Capacity fade per day (0.03%)
-                 cycle_fade_per_kwh=0.00001,  # Capacity fade per kWh cycled
+                 calendar_fade_rate=0.00005,  # Capacity fade per day (~1.8%/yr at reference conditions)
+                 cycle_fade_per_kwh=0.0000003,  # Capacity fade per kWh cycled
                  lifetime_throughput_MWh=None,  # Total throughput limit (MWh)
                  lifetime_cycles=None,  # Total cycle limit
                  lifetime_years=10.0):
@@ -382,8 +382,8 @@ class KiBaMBattery:
                  c_fraction=0.3,
                  temperature_coefficient=-0.003,
                  degradation_temp_sensitivity=0.025,
-                 calendar_fade_rate=0.0003,
-                 cycle_fade_per_kwh=0.00001,
+                 calendar_fade_rate=0.00005,
+                 cycle_fade_per_kwh=0.0000003,
                  end_of_life_capacity_fraction=0.80,
                  lifetime_throughput_MWh=None,
                  lifetime_cycles=None,

@@ -4,251 +4,218 @@ from math import cos, pi, radians, sin
 import numpy as np
 import pandas as pd
 
-# USER PARAMETERS
 
-LAT = -1.94        # Kigali latitude
-TILT = radians(15) # panel tilt
-ALBEDO = 0.2
+DEFAULT_LATITUDE_DEG = 0.0
+DEFAULT_TILT_DEG = 15.0
+DEFAULT_PANEL_AZIMUTH_DEG = 0.0
+DEFAULT_ALBEDO = 0.2
+DEFAULT_TEMP_COEFF_POWER = -0.00408
+DEFAULT_NOCT_C = 46.0
+DEFAULT_SYSTEM_LOSSES = 0.15
+DEFAULT_INVERTER_EFFICIENCY = 0.96
+DEFAULT_SYSTEM_SIZE_W = 100000.0
+DEFAULT_MODULE_STC_W = 320.0
 
-ETA_REF = 0.165
-TEMP_COEFF = 0.00408
-NOCT = 46
 
-SYSTEM_SIZE = 100000  # 100 kWp
+def extraterrestrial_hour(day_of_year, hour, lat_deg=DEFAULT_LATITUDE_DEG):
+    """Return hourly extraterrestrial horizontal irradiance and sun angles."""
+    gsc = 1367.0
+    b = 2 * pi * (day_of_year - 1) / 365
 
-# Example module datasheet values: Astronergy CHSM6612P-320.
-MODULE_STC_W = 320.0
-MODULE_VMPP_STC = 35.86
-MODULE_IMPP_STC = 8.93
-MODULE_VOC_STC = 45.68
-MODULE_ISC_STC = 9.06
-MODULE_FF_STC = (MODULE_VMPP_STC * MODULE_IMPP_STC) / (MODULE_VOC_STC * MODULE_ISC_STC)
-VOC_TEMP_COEFF_REL = -0.00311
-ISC_TEMP_COEFF_REL = 0.0005
-# Not listed directly in the datasheet, so this remains an explicit assumption.
-FF_TEMP_COEFF_REL = -0.0005
+    e0 = (
+        1.00011
+        + 0.034221 * cos(b)
+        + 0.00128 * sin(b)
+        + 0.000719 * cos(2 * b)
+        + 0.000077 * sin(2 * b)
+    )
 
-# EXTRATERRESTRIAL RADIATION
-def extraterrestrial_hour(day_of_year, hour):
+    decl = radians(23.45 * sin(radians(360 * (284 + day_of_year) / 365)))
+    omega = radians(15 * (hour - 12))
+    phi = radians(lat_deg)
 
-    Gsc = 1367
-
-    B = 2*pi*(day_of_year-1)/365
-
-    E0 = 1.00011 + 0.034221*cos(B) + 0.00128*sin(B) \
-         + 0.000719*cos(2*B) + 0.000077*sin(2*B)
-
-    # declination (radians)
-    decl = radians(23.45*sin(radians(360*(284+day_of_year)/365)))
-
-    # hour angle (radians)
-    omega = radians(15*(hour-12))
-
-    phi = radians(LAT)
-
-    # solar altitude
-    sin_alt = sin(phi)*sin(decl) + cos(phi)*cos(decl)*cos(omega)
-
+    sin_alt = sin(phi) * sin(decl) + cos(phi) * cos(decl) * cos(omega)
     if sin_alt <= 0:
         return 0.0, 0.0, 0.0
 
     alt_rad = np.arcsin(sin_alt)
-
-    # solar azimuth (radians) measured from north towards east
-    # compute cosine of azimuth
-    cos_az = (sin(decl)*cos(phi) - cos(decl)*sin(phi)*cos(omega)) / max(cos(alt_rad), 1e-8)
-    # numerical safety
+    cos_az = (
+        (sin(decl) * cos(phi) - cos(decl) * sin(phi) * cos(omega))
+        / max(cos(alt_rad), 1e-8)
+    )
     cos_az = np.clip(cos_az, -1.0, 1.0)
     az = np.arccos(cos_az)
-    # determine correct quadrant using hour angle
     if sin(omega) > 0:
-        az = 2*pi - az
+        az = 2 * pi - az
 
-    G0h = Gsc*E0*sin_alt
+    g0h = gsc * e0 * sin_alt
+    return g0h, alt_rad, az
 
-    return G0h, alt_rad, az
 
-# TAG MODEL (hourly profile)
-
-def tag_profile(hour):
-
-    sunrise = 6
-    sunset = 18
-
+def tag_profile(hour, sunrise=6.0, sunset=18.0):
     if hour < sunrise or hour > sunset:
-        return 0
+        return 0.0
+    return sin(pi * (hour - sunrise) / max(sunset - sunrise, 1e-6))
 
-    return sin(pi*(hour-sunrise)/(sunset-sunrise))
 
-# ERBS MODEL
-
-def erbs_model(GHI, G0h, sin_alt):
-
-    # GHI and G0h in W/m2
-    if G0h <= 0:
+def erbs_model(ghi, g0h, sin_alt):
+    if g0h <= 0:
         return 0.0, 0.0
 
-    Kt = GHI / G0h if G0h > 0 else 0.0
-
-    if Kt <= 0.22:
-        Fd = 1 - 0.09*Kt
-    elif Kt <= 0.8:
-        Fd = 0.9511 - 0.1604*Kt + 4.388*Kt**2 - 16.638*Kt**3 + 12.336*Kt**4
+    kt = ghi / g0h if g0h > 0 else 0.0
+    if kt <= 0.22:
+        diffuse_fraction = 1 - 0.09 * kt
+    elif kt <= 0.8:
+        diffuse_fraction = (
+            0.9511
+            - 0.1604 * kt
+            + 4.388 * kt**2
+            - 16.638 * kt**3
+            + 12.336 * kt**4
+        )
     else:
-        Fd = 0.165
+        diffuse_fraction = 0.165
 
-    DHI = Fd*GHI
+    diffuse_fraction = float(np.clip(diffuse_fraction, 0.0, 1.0))
+    dhi = diffuse_fraction * ghi
+    dni = max(0.0, (ghi - dhi) / max(sin_alt, 1e-6))
+    return dhi, dni
 
-    # avoid division by zero: sin_alt ~ 0 when sun near horizon
-    DNI = (GHI - DHI) / max(sin_alt, 1e-6)
 
-    return DHI, DNI
+def transposition(
+    ghi,
+    dhi,
+    dni,
+    alt_rad,
+    az,
+    tilt_deg=DEFAULT_TILT_DEG,
+    panel_azimuth_deg=DEFAULT_PANEL_AZIMUTH_DEG,
+    albedo=DEFAULT_ALBEDO,
+):
+    """Transpose irradiance from horizontal plane to the array plane."""
+    tilt_rad = radians(tilt_deg)
+    panel_azimuth_rad = radians(panel_azimuth_deg)
 
-# TRANSPOSITION MODEL
-
-def transposition(GHI, DHI, DNI, alt_rad, az):
-    """Compute irradiance on tilted surface using vector incidence-angle.
-
-    az : solar azimuth (radians) measured from north toward east
-    Panel azimuth: facing north => 0 rad. Tilt `TILT` is already in radians.
-    """
-    # sun direction unit vector (east, north, up)
     cos_alt = max(np.cos(alt_rad), 0.0)
     sx = cos_alt * np.sin(az)
     sy = cos_alt * np.cos(az)
     sz = np.sin(alt_rad)
 
-    # panel normal (east, north, up) — panel azimuth = 0 (north-facing)
-    panel_az = 0.0
-    nx = np.sin(TILT) * np.sin(panel_az)
-    ny = np.sin(TILT) * np.cos(panel_az)
-    nz = np.cos(TILT)
+    nx = np.sin(tilt_rad) * np.sin(panel_azimuth_rad)
+    ny = np.sin(tilt_rad) * np.cos(panel_azimuth_rad)
+    nz = np.cos(tilt_rad)
 
-    cos_theta = sx*nx + sy*ny + sz*nz
-    cos_theta = max(cos_theta, 0.0)
+    cos_theta = max(0.0, sx * nx + sy * ny + sz * nz)
 
-    Gb = DNI * cos_theta
-    Gd = DHI * (1 + np.cos(TILT)) / 2
-    Gr = GHI * ALBEDO * (1 - np.cos(TILT)) / 2
-
-    return Gb + Gd + Gr
+    beam = dni * cos_theta
+    sky_diffuse = dhi * (1 + np.cos(tilt_rad)) / 2
+    ground_reflected = ghi * albedo * (1 - np.cos(tilt_rad)) / 2
+    return max(0.0, beam + sky_diffuse + ground_reflected)
 
 
-# TEMPERATURE MODEL
-
-def hourly_temperature(Tmin, Tmax, h):
-    if 6 <= h <= 18:
-        return Tmin + (Tmax - Tmin) * sin(pi * (h - 6) / 12)
-    else:
-        return Tmin
-
-# CELL TEMPERATURE
-# simple NOCT-based model
-
-def cell_temperature(Ta, Gt):
-    return Ta + (NOCT - 20) / 800 * Gt
+def cell_temperature(ambient_temp_c, plane_of_array_irradiance_w_m2, noct_c=DEFAULT_NOCT_C):
+    return ambient_temp_c + (noct_c - 20.0) / 800.0 * plane_of_array_irradiance_w_m2
 
 
-# PV POWER MODEL
+def pv_power_efficiency_model(
+    plane_of_array_irradiance_w_m2,
+    cell_temp_c,
+    system_size_w=DEFAULT_SYSTEM_SIZE_W,
+    temp_coeff_power=DEFAULT_TEMP_COEFF_POWER,
+    system_losses=DEFAULT_SYSTEM_LOSSES,
+    inverter_efficiency=DEFAULT_INVERTER_EFFICIENCY,
+):
+    """Simple AC PV power model using datasheet-style performance adjustments."""
+    if plane_of_array_irradiance_w_m2 <= 0 or system_size_w <= 0:
+        return 0.0
 
-def pv_power_efficiency_model(Gt, Tc):
-    """Simple efficiency-based PV model (kept for reference).
-    Gt in W/m2, Tc in C. Returns power in W.
-    """
-    eta = ETA_REF * (1 - TEMP_COEFF * (Tc - 25))
-    area = SYSTEM_SIZE / (1000 * ETA_REF)
-    P = eta * area * Gt
-    return max(P, 0.0)
-
-
-# --- Fill-factor PV model ---
-def pv_power_fillfactor(Gt, Tc, isc_temp_coeff_rel=ISC_TEMP_COEFF_REL):
-    """Fill-factor based PV model.
-
-    Module values come from the CHSM6612P-320 datasheet:
-    - Pmpp = 320 W
-    - Vmpp = 35.86 V
-    - Impp = 8.93 A
-    - Voc = 45.68 V
-    - Isc = 9.06 A
-    - FF_stc = Vmpp * Impp / (Voc * Isc)
-    - Voc temperature coefficient = -0.311 %/K
-    - FF temperature coefficient remains an explicit modeling assumption
-
-    The model computes Isc proportional to irradiance, Voc adjusted by temperature,
-    and P_module = Voc * Isc * FF. The array size SYSTEM_SIZE (W) sets number
-    of modules = SYSTEM_SIZE / P_stc.
-    """
-    # CHSM6612P-320 datasheet parameters
-    n_modules = max(1, int(np.ceil(SYSTEM_SIZE / MODULE_STC_W)))
-
-    # irradiance ratio (STC=1000 W/m2)
-    irr_ratio = max(Gt / 1000.0, 0.0)
-
-    Isc = MODULE_ISC_STC * irr_ratio * (1 + isc_temp_coeff_rel * (Tc - 25.0))
-    Voc = MODULE_VOC_STC * (1 + VOC_TEMP_COEFF_REL * (Tc - 25.0))
-    FF = MODULE_FF_STC * (1 + FF_TEMP_COEFF_REL * (Tc - 25.0))
-    FF = max(0.0, FF)
-
-    P_module = Voc * Isc * FF
-    P_array = P_module * n_modules
-    return max(P_array, 0.0)
+    temp_factor = 1.0 + temp_coeff_power * (cell_temp_c - 25.0)
+    temp_factor = max(temp_factor, 0.0)
+    dc_power_w = system_size_w * (plane_of_array_irradiance_w_m2 / 1000.0) * temp_factor
+    ac_power_w = dc_power_w * (1.0 - system_losses) * inverter_efficiency
+    return max(0.0, ac_power_w)
 
 
-def pv_power_from_ghi(timestamp, ghi_w_m2, ambient_temp_c, system_size_w=SYSTEM_SIZE, isc_temp_coeff_rel=ISC_TEMP_COEFF_REL):
-    """PV performance pipeline for one timestamp.
+def pv_power_from_ghi(
+    timestamp,
+    ghi_w_m2,
+    ambient_temp_c,
+    system_size_w=DEFAULT_SYSTEM_SIZE_W,
+    latitude_deg=DEFAULT_LATITUDE_DEG,
+    tilt_deg=DEFAULT_TILT_DEG,
+    panel_azimuth_deg=DEFAULT_PANEL_AZIMUTH_DEG,
+    albedo=DEFAULT_ALBEDO,
+    temp_coeff_power=DEFAULT_TEMP_COEFF_POWER,
+    noct_c=DEFAULT_NOCT_C,
+    system_losses=DEFAULT_SYSTEM_LOSSES,
+    inverter_efficiency=DEFAULT_INVERTER_EFFICIENCY,
+):
+    """Compute PV output and traceable intermediates from horizontal irradiance."""
+    ts = pd.Timestamp(timestamp)
+    day_of_year = ts.dayofyear
+    hour = ts.hour + ts.minute / 60.0
 
-    Starting from horizontal irradiance, this applies:
-    1. extraterrestrial radiation / solar position
-    2. ERBS diffuse/direct split
-    3. tilt transposition
-    4. NOCT cell temperature
-    5. fill-factor PV power model
-
-    Returns a dict with the main intermediate values so downstream models can
-    save traceable PV inputs and outputs.
-    """
-    day_of_year = pd.Timestamp(timestamp).dayofyear
-    hour = pd.Timestamp(timestamp).hour + pd.Timestamp(timestamp).minute / 60.0
-
-    G0h, alt_rad, az = extraterrestrial_hour(day_of_year, hour)
-    sin_alt = np.sin(alt_rad) if G0h > 0 else 0.0
-    DHI, DNI = erbs_model(ghi_w_m2, G0h, sin_alt)
-    tilted_irradiance = transposition(ghi_w_m2, DHI, DNI, alt_rad, az) if G0h > 0 else 0.0
-    cell_temp_c = cell_temperature(ambient_temp_c, tilted_irradiance)
-
-    global SYSTEM_SIZE
-    previous_system_size = SYSTEM_SIZE
-    SYSTEM_SIZE = system_size_w
-    try:
-        pv_power_w = pv_power_fillfactor(
-            tilted_irradiance,
-            cell_temp_c,
-            isc_temp_coeff_rel=isc_temp_coeff_rel
+    g0h, alt_rad, az = extraterrestrial_hour(day_of_year, hour, lat_deg=latitude_deg)
+    sin_alt = np.sin(alt_rad) if g0h > 0 else 0.0
+    dhi, dni = erbs_model(ghi_w_m2, g0h, sin_alt)
+    tilted_irradiance = (
+        transposition(
+            ghi_w_m2,
+            dhi,
+            dni,
+            alt_rad,
+            az,
+            tilt_deg=tilt_deg,
+            panel_azimuth_deg=panel_azimuth_deg,
+            albedo=albedo,
         )
-    finally:
-        SYSTEM_SIZE = previous_system_size
-
-    module_stc_w = MODULE_STC_W
-    module_count = max(1, int(np.ceil(system_size_w / module_stc_w)))
+        if g0h > 0
+        else 0.0
+    )
+    cell_temp_c = cell_temperature(ambient_temp_c, tilted_irradiance, noct_c=noct_c)
+    pv_power_w = pv_power_efficiency_model(
+        tilted_irradiance,
+        cell_temp_c,
+        system_size_w=system_size_w,
+        temp_coeff_power=temp_coeff_power,
+        system_losses=system_losses,
+        inverter_efficiency=inverter_efficiency,
+    )
 
     return {
-        "ghi_w_m2": ghi_w_m2,
-        "dhi_w_m2": DHI,
-        "dni_w_m2": DNI,
-        "tilted_irradiance_w_m2": tilted_irradiance,
-        "ambient_temp_c": ambient_temp_c,
-        "cell_temp_c": cell_temp_c,
-        "pv_power_w": pv_power_w,
-        "module_count": module_count,
-        "module_stc_w": module_stc_w,
-        "module_ff_stc": MODULE_FF_STC,
-        "module_isc_temp_coeff_rel": isc_temp_coeff_rel,
+        "ghi_w_m2": float(max(0.0, ghi_w_m2)),
+        "dhi_w_m2": float(dhi),
+        "dni_w_m2": float(dni),
+        "tilted_irradiance_w_m2": float(tilted_irradiance),
+        "ambient_temp_c": float(ambient_temp_c),
+        "cell_temp_c": float(cell_temp_c),
+        "pv_power_w": float(pv_power_w),
+        "system_size_w": float(system_size_w),
+        "latitude_deg": float(latitude_deg),
+        "tilt_deg": float(tilt_deg),
+        "panel_azimuth_deg": float(panel_azimuth_deg),
+        "albedo": float(albedo),
+        "system_losses": float(system_losses),
+        "inverter_efficiency": float(inverter_efficiency),
+        "temp_coeff_power": float(temp_coeff_power),
+        "noct_c": float(noct_c),
+        "module_count": int(max(1, np.ceil(system_size_w / DEFAULT_MODULE_STC_W))),
+        "module_stc_w": float(DEFAULT_MODULE_STC_W),
     }
+
 
 def run_pv_simulation_from_power_file(
     file_path="POWER_Point_Daily_20250101_20251231_001d94S_030d06E_LST.csv",
     output_path="pv_simulation_output.csv",
+    latitude_deg=DEFAULT_LATITUDE_DEG,
+    tilt_deg=DEFAULT_TILT_DEG,
+    panel_azimuth_deg=DEFAULT_PANEL_AZIMUTH_DEG,
+    albedo=DEFAULT_ALBEDO,
+    temp_coeff_power=DEFAULT_TEMP_COEFF_POWER,
+    noct_c=DEFAULT_NOCT_C,
+    system_losses=DEFAULT_SYSTEM_LOSSES,
+    inverter_efficiency=DEFAULT_INVERTER_EFFICIENCY,
+    system_size_w=DEFAULT_SYSTEM_SIZE_W,
 ):
     """Run the PV workflow from a NASA/POWER daily file."""
     header_row = 0
@@ -269,35 +236,42 @@ def run_pv_simulation_from_power_file(
     results = []
     for _, row in data.iterrows():
         day = row["DATE"]
-        doy = day.dayofyear
-        Tmin = row["T2M_MIN"]
-        Tmax = row["T2M_MAX"]
         daily_ghi_kwh_per_m2 = row["ALLSKY_SFC_SW_DWN"]
+        tmin = row["T2M_MIN"]
+        tmax = row["T2M_MAX"]
 
-        weights = np.array([tag_profile(h) for h in range(24)])
+        weights = np.array([tag_profile(h) for h in range(24)], dtype=float)
         if weights.sum() == 0:
             hourly_ghi = np.zeros(24)
         else:
             hourly_ghi = daily_ghi_kwh_per_m2 * 1000.0 * weights / weights.sum()
 
-        for h in range(24):
-            ghi = hourly_ghi[h]
-            G0h, alt_rad, az = extraterrestrial_hour(doy, h)
-            DHI, DNI = erbs_model(ghi, G0h, np.sin(alt_rad) if alt_rad is not None else 0.0)
-            Gt = transposition(ghi, DHI, DNI, alt_rad, az)
-            Ta = hourly_temperature(Tmin, Tmax, h)
-            Tc = cell_temperature(Ta, Gt)
-            P = pv_power_fillfactor(Gt, Tc)
+        for hour in range(24):
+            ambient_temp_c = tmin + (tmax - tmin) * tag_profile(hour)
+            pv_state = pv_power_from_ghi(
+                timestamp=day + pd.Timedelta(hours=hour),
+                ghi_w_m2=float(hourly_ghi[hour]),
+                ambient_temp_c=float(ambient_temp_c),
+                system_size_w=system_size_w,
+                latitude_deg=latitude_deg,
+                tilt_deg=tilt_deg,
+                panel_azimuth_deg=panel_azimuth_deg,
+                albedo=albedo,
+                temp_coeff_power=temp_coeff_power,
+                noct_c=noct_c,
+                system_losses=system_losses,
+                inverter_efficiency=inverter_efficiency,
+            )
             results.append(
                 {
-                    "datetime": day + pd.Timedelta(hours=h),
-                    "GHI": ghi,
-                    "DHI": DHI,
-                    "DNI": DNI,
-                    "Tilt_Irradiance": Gt,
-                    "Temperature": Ta,
-                    "Cell_Temp": Tc,
-                    "PV_Power_W": P,
+                    "datetime": day + pd.Timedelta(hours=hour),
+                    "GHI": pv_state["ghi_w_m2"],
+                    "DHI": pv_state["dhi_w_m2"],
+                    "DNI": pv_state["dni_w_m2"],
+                    "Tilt_Irradiance": pv_state["tilted_irradiance_w_m2"],
+                    "Temperature": pv_state["ambient_temp_c"],
+                    "Cell_Temp": pv_state["cell_temp_c"],
+                    "PV_Power_W": pv_state["pv_power_w"],
                 }
             )
 
