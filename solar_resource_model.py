@@ -2,16 +2,9 @@ import calendar
 
 import numpy as np
 import pandas as pd
-
-
 class SolarResourceSimulator:
     """
     Simulate hourly global horizontal irradiance (GHI) from monthly clearness index.
-
-    The implementation keeps the original Markov-chain plus TAG-style structure, but
-    removes the Kigali-only framing so the synthetic resource can be used for any
-    site. Monthly clearness indices still drive the local climate character, while
-    latitude controls sun geometry and seasonal timing.
     """
 
     DEFAULT_TRANSITION_MATRIX = np.array([
