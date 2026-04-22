@@ -1,33 +1,71 @@
-# MicroGridModeler
+# Microgrid Modeler
 
-MicroGridModeler is a user-facing microgrid design tool. A user can enter datasheet values for the currently implemented sources and storage systems, run the simulation, and review the output through clearer visuals and downloadable result tables. The simulator includes lifecycle project economics with CAPEX, O&M, replacement scheduling, fuel-price escalation, discounted cash flow, DSCR, Monte Carlo risk outputs, and LCOE reporting. It also supports optional timestamped meteorological/resource CSV inputs and a hydropower plant model. The codebase is organized so other energy sources can be added later.
+Microgrid Modeler is a Streamlit-based design and analysis tool for hybrid microgrids. It lets you enter component datasheet assumptions, optionally load measured resource and demand CSVs, run a time-series simulation, and review technical and financial results through charts, KPI cards, tables, and downloadable outputs.
+
+The current model supports:
+- Solar PV
+- Wind
+- Hydropower
+- Diesel generation
+- Battery storage
+- Demand-side management inputs
+- Lifecycle project economics and finance metrics
+- Monte Carlo financial risk summaries
+
+## What The App Does
+
+The app in `app.py` provides a user interface for:
+- Entering system sizing and datasheet-style assumptions
+- Setting site latitude and longitude for synthetic resource generation
+- Uploading or referencing resource and load CSV files
+- Running the dispatch simulation with `load_following` or `cycle_charging`
+- Reviewing reliability, renewable penetration, fuel use, battery behavior, and economics
+- Downloading detailed results, metrics, cash flow, and Monte Carlo outputs
+
+The simulation engine lives in `microgrid_simulation.py`.
 
 ## Main Files
-- `streamlit_app.py` - Streamlit interface for entering datasheet values and viewing outputs
-- `microgrid_simulation.py` - main simulation engine, resource-data ingestion, and lifecycle economics model
-- `dispatch_model.py` - dispatch optimization logic
-- `energy_components.py` - component models for the currently implemented energy sources, including hydropower
-- `battery_module.py` - battery system behavior
-- `demand_model.py` - load profile generation
-- `solar_resource_model.py` - solar resource generation
-- `solar_pv_model.py` - PV performance calculations
 
-## Site Flexibility
-- The synthetic resource model is no longer tied to Kigali. Latitude, longitude, PV tilt, PV azimuth, and ground albedo can be changed for other markets and project sites.
-- When a measured resource CSV is available, it should be preferred over synthetic weather for validation and decision support.
+- `app.py`: Streamlit interface and result visualization
+- `microgrid_simulation.py`: time-series simulation, dispatch integration, data ingestion, and lifecycle economics
+- `dispatch_model.py`: dispatch logic
+- `energy_components.py`: PV, wind, hydro, and diesel component models
+- `battery_module.py`: battery storage behavior and degradation
+- `demand_model.py`: load profile generation
+- `solar_resource_model.py`: synthetic solar resource generation
+- `solar_pv_model.py`: PV irradiance transposition and power calculations
+- `Example csv/load_profile_example.csv`: sample demand input
+- `Example csv/resource_profile_example.csv`: sample resource input
 
-## Economic Outputs
-- Upfront CAPEX
-- Operating cost per kWh served
-- Lifecycle cost (NPV)
-- LCOE
-- Replacement schedule cash flow
-- Fuel use and outage-penalty costs
-- DSCR summary
-- Monte Carlo P50 and P90 outputs for key finance metrics
+## Core Features
 
-## Resource CSV Inputs
-You can optionally point the app to a timestamped resource CSV. Supported column names include:
+- Flexible simulation timestep support through the engine
+- Synthetic resource generation using project latitude and longitude
+- Optional measured resource and load CSV ingestion
+- Solar PV performance based on irradiance, temperature, tilt, azimuth, and system losses
+- Wind, hydro, diesel, and battery dispatch over the model horizon
+- Diesel reliability and maintenance modeling
+- Demand-side management settings for peak reduction and load shifting
+- Lifecycle economics including CAPEX, O&M, replacements, salvage value, and discounted cash flow
+- Financial outputs including LCOE, DSCR, and Monte Carlo P10/P50/P90-style summaries
+
+## Supported Inputs
+
+### Site And System Inputs
+
+The app allows you to configure:
+- Latitude and longitude
+- PV, wind, hydro, diesel, and battery capacities
+- Diesel rating in `kW` or `kVA` with power factor treatment in the engine
+- PV performance assumptions such as tilt, azimuth, albedo, losses, inverter efficiency, and temperature effects
+- Load assumptions and load type
+- Economic assumptions such as project life, discount rate, tariff, CAPEX, O&M, debt, and fuel-price escalation
+
+### Optional CSV Inputs
+
+You can provide timestamped CSV inputs instead of relying only on synthetic profiles.
+
+Supported resource/load columns include:
 - `timestamp` or `datetime`
 - `ghi_w_m2` or `ghi`
 - `wind_speed_ms`
@@ -36,20 +74,67 @@ You can optionally point the app to a timestamped resource CSV. Supported column
 - `hydro_head_m`
 - `load_kw`
 
-If one of these columns is missing, the simulator falls back to its internal synthetic model for that variable.
+If a supported column is missing, the simulator falls back to its internal model for that variable when possible.
 
-## Presentation Guidance
-- Use scenario analysis to compare alternative system designs instead of presenting only one base case.
-- Use sensitivity analysis for fuel price, tariff, load growth, PV output, and storage size.
-- Validate against measured load/resource data when possible, and state clearly when synthetic profiles are being used.
-- Report model limitations explicitly, especially for early-stage screening cases without measured input data.
+Example files are included in the `Example csv` folder.
 
-## Run The Streamlit App
+## Outputs
+
+The app reports both technical and financial results, including:
+- Load served fraction
+- Renewable fraction
+- Fuel consumption
+- Diesel runtime and outage metrics
+- Battery state of charge behavior
+- Load shedding and loss-of-load metrics
+- PV specific yield and solar capacity factor
+- Upfront CAPEX
+- Discounted lifecycle cost
+- Operating cost per kWh served
+- LCOE
+- DSCR metrics
+- Monte Carlo summary statistics for finance outputs
+
+Downloadable files from the app include:
+- Results time-series CSV
+- Metrics CSV
+- Lifecycle cash flow CSV
+- Monte Carlo summary CSV
+- Monte Carlo samples CSV
+
+## Running The App
+
+Install the Python dependencies used by the codebase, then start Streamlit with:
+
 ```bash
-streamlit run streamlit_app.py
+streamlit run app.py
 ```
 
-## Run The Script Version
+## Running The Simulation Script
+
+You can also run the engine directly:
+
 ```bash
 python microgrid_simulation.py
 ```
+
+This runs the built-in example case defined at the bottom of the simulation module.
+
+## Suggested Workflow
+
+1. Enter component datasheet values and operating assumptions in the sidebar.
+2. Upload or reference measured resource and load CSVs if available.
+3. Run the simulation.
+4. Compare reliability, renewable contribution, battery behavior, diesel dependence, and lifecycle cost.
+5. Export the outputs for reporting or scenario comparison.
+
+## Notes On Model Use
+
+- Measured resource and demand data should be preferred whenever available.
+- Synthetic profiles are most appropriate for early-stage screening rather than bankable studies.
+- Scenario analysis is recommended for capacity sizing, fuel sensitivity, tariff sensitivity, and storage tradeoffs.
+- Financial outputs depend strongly on the economic assumptions entered by the user.
+
+## Status
+
+This project is structured so additional technologies and modeling improvements can be added over time.
