@@ -1,7 +1,8 @@
 import calendar
 
 import numpy as np
-import pandas as pd
+
+
 class SolarResourceSimulator:
     """
     Simulate hourly global horizontal irradiance (GHI) from monthly clearness index.
@@ -131,10 +132,3 @@ class SolarResourceSimulator:
                 results.extend(self.generate_hourly_data(kt_daily, day_of_year))
                 day_of_year += 1
         return results
-
-
-if __name__ == "__main__":
-    sim = SolarResourceSimulator(lat=0.0, lon=0.0, random_seed=42)
-    hourly_data = sim.run_full_year()
-    df = pd.DataFrame({"hour": range(len(hourly_data)), "ghi_w_m2": hourly_data})
-    print(df.head(24))

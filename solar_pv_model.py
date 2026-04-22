@@ -1,4 +1,3 @@
-import io
 from math import cos, pi, radians, sin
 
 import numpy as np
@@ -50,12 +49,6 @@ def extraterrestrial_hour(day_of_year, hour, lat_deg=DEFAULT_LATITUDE_DEG):
 
     g0h = gsc * e0 * sin_alt
     return g0h, alt_rad, az
-
-
-def tag_profile(hour, sunrise=6.0, sunset=18.0):
-    if hour < sunrise or hour > sunset:
-        return 0.0
-    return sin(pi * (hour - sunrise) / max(sunset - sunrise, 1e-6))
 
 
 def erbs_model(ghi, g0h, sin_alt):
@@ -202,85 +195,3 @@ def pv_power_from_ghi(
         "module_count": int(max(1, np.ceil(system_size_w / DEFAULT_MODULE_STC_W))),
         "module_stc_w": float(DEFAULT_MODULE_STC_W),
     }
-
-
-def run_pv_simulation_from_power_file(
-    file_path="POWER_Point_Daily_20250101_20251231_001d94S_030d06E_LST.csv",
-    output_path="pv_simulation_output.csv",
-    latitude_deg=DEFAULT_LATITUDE_DEG,
-    tilt_deg=DEFAULT_TILT_DEG,
-    panel_azimuth_deg=DEFAULT_PANEL_AZIMUTH_DEG,
-    albedo=DEFAULT_ALBEDO,
-    temp_coeff_power=DEFAULT_TEMP_COEFF_POWER,
-    noct_c=DEFAULT_NOCT_C,
-    system_losses=DEFAULT_SYSTEM_LOSSES,
-    inverter_efficiency=DEFAULT_INVERTER_EFFICIENCY,
-    system_size_w=DEFAULT_SYSTEM_SIZE_W,
-):
-    """Run the PV workflow from a NASA/POWER daily file."""
-    header_row = 0
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-        for i, line in enumerate(lines):
-            if line.strip().startswith("YEAR"):
-                header_row = i
-                break
-
-    data = pd.read_csv(io.StringIO("".join(lines[header_row:])))
-    data["DATE"] = pd.to_datetime(
-        data[["YEAR", "MO", "DY"]].rename(
-            columns={"YEAR": "year", "MO": "month", "DY": "day"}
-        )
-    )
-
-    results = []
-    for _, row in data.iterrows():
-        day = row["DATE"]
-        daily_ghi_kwh_per_m2 = row["ALLSKY_SFC_SW_DWN"]
-        tmin = row["T2M_MIN"]
-        tmax = row["T2M_MAX"]
-
-        weights = np.array([tag_profile(h) for h in range(24)], dtype=float)
-        if weights.sum() == 0:
-            hourly_ghi = np.zeros(24)
-        else:
-            hourly_ghi = daily_ghi_kwh_per_m2 * 1000.0 * weights / weights.sum()
-
-        for hour in range(24):
-            ambient_temp_c = tmin + (tmax - tmin) * tag_profile(hour)
-            pv_state = pv_power_from_ghi(
-                timestamp=day + pd.Timedelta(hours=hour),
-                ghi_w_m2=float(hourly_ghi[hour]),
-                ambient_temp_c=float(ambient_temp_c),
-                system_size_w=system_size_w,
-                latitude_deg=latitude_deg,
-                tilt_deg=tilt_deg,
-                panel_azimuth_deg=panel_azimuth_deg,
-                albedo=albedo,
-                temp_coeff_power=temp_coeff_power,
-                noct_c=noct_c,
-                system_losses=system_losses,
-                inverter_efficiency=inverter_efficiency,
-            )
-            results.append(
-                {
-                    "datetime": day + pd.Timedelta(hours=hour),
-                    "GHI": pv_state["ghi_w_m2"],
-                    "DHI": pv_state["dhi_w_m2"],
-                    "DNI": pv_state["dni_w_m2"],
-                    "Tilt_Irradiance": pv_state["tilted_irradiance_w_m2"],
-                    "Temperature": pv_state["ambient_temp_c"],
-                    "Cell_Temp": pv_state["cell_temp_c"],
-                    "PV_Power_W": pv_state["pv_power_w"],
-                }
-            )
-
-    df = pd.DataFrame(results)
-    df.to_csv(output_path, index=False)
-    return df
-
-
-if __name__ == "__main__":
-    df = run_pv_simulation_from_power_file()
-    annual_energy = df["PV_Power_W"].sum() / 1000.0
-    print("Annual PV Energy (kWh):", annual_energy)
