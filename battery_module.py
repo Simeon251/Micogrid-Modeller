@@ -454,6 +454,8 @@ class KiBaMBattery:
 
     def get_soc(self):
         """Return state of charge [0-1]."""
+        if self.current_capacity_kwh <= 1e-9:
+            return 0.0
         return min(1.0, max(0.0, self.get_energy_kwh() / self.current_capacity_kwh))
 
     def get_min_soc(self):
@@ -602,11 +604,12 @@ class KiBaMBattery:
         return False
 
     def status(self):
+        nominal_capacity = max(self.nominal_capacity_kwh, 1e-9)
         return {
             'state_of_charge': self.get_soc(),
             'energy_kwh': self.get_energy_kwh(),
             'capacity_kwh': self.current_capacity_kwh,
-            'capacity_fade_percent': (1 - self.current_capacity_kwh / self.nominal_capacity_kwh) * 100.0,
+            'capacity_fade_percent': (1 - self.current_capacity_kwh / nominal_capacity) * 100.0,
             'max_charge_power_kw': self.get_max_charge_power(),
             'max_discharge_power_kw': self.get_max_discharge_power(),
             'operating_hours': self.operating_hours,

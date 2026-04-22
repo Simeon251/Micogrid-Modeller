@@ -1308,6 +1308,8 @@ class MicrogridSimulation:
             )
             total_renewable_served_kwh = renewable_served_kwh + renewable_battery_served_kwh
 
+            nominal_battery_capacity = max(self.battery.nominal_capacity_kwh, 1e-9)
+
             timestep_result = {
                 'timestamp': timestamp,
                 'step': step,
@@ -1364,7 +1366,7 @@ class MicrogridSimulation:
                 'diesel_operating_hours': self.diesel_gen.runtime_hours,
                 'battery_soc_before': dispatch.get('battery_soc_before', np.nan),
                 'battery_soc_after': dispatch.get('battery_soc_after', np.nan),
-                'battery_health': self.battery.current_capacity_kwh / self.battery.nominal_capacity_kwh,
+                'battery_health': self.battery.current_capacity_kwh / nominal_battery_capacity,
                 'battery_temperature_c': self.battery.current_temp_c,
                 'battery_renewable_energy_kwh': self.battery_renewable_energy_kwh,
             }
