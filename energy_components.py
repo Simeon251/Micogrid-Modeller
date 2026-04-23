@@ -151,6 +151,8 @@ class WindTurbine:
         rated_power_kw=100.0,
         swept_area_m2=397.6,
         hub_height_m=34.0,
+        reference_height_m=10.0,
+        shear_exponent=0.14,
         cut_in=3.5,
         rated_speed=10.5,
         cut_out=20.0,
@@ -160,6 +162,8 @@ class WindTurbine:
         self.rated_power_kw = rated_power_kw
         self.swept_area_m2 = swept_area_m2
         self.hub_height_m = hub_height_m
+        self.reference_height_m = max(reference_height_m, 1e-6)
+        self.shear_exponent = shear_exponent
         self.cut_in = cut_in
         self.rated_speed = rated_speed
         self.cut_out = cut_out
@@ -172,11 +176,15 @@ class WindTurbine:
         gas_constant = 287.05
         return pressure / (gas_constant * temp_k)
 
-    def wind_speed_at_hub(self, wind_speed_ref, ref_height=10.0, alpha=0.14):
+    def wind_speed_at_hub(self, wind_speed_ref, ref_height=None, alpha=None):
+        ref_height = self.reference_height_m if ref_height is None else max(ref_height, 1e-6)
+        alpha = self.shear_exponent if alpha is None else alpha
         return wind_speed_ref * (self.hub_height_m / ref_height) ** alpha
 
     def power_output(self, wind_speed, temp_c=15.0, elevation_m=0.0):
-        wind = wind_speed
+        # Treat the supplied wind speed as a reference-height measurement and
+        # extrapolate it to the turbine hub height before applying the power curve.
+        wind = self.wind_speed_at_hub(wind_speed)
         rho = self.air_density(temp_c, elevation_m)
         if wind < self.cut_in or wind >= self.cut_out:
             return 0.0
@@ -198,6 +206,8 @@ class WindTurbine:
             "end_of_life": self.operating_years >= self.lifetime_years,
             "rated_power_kw": self.rated_power_kw,
             "hub_height_m": self.hub_height_m,
+            "reference_height_m": self.reference_height_m,
+            "shear_exponent": self.shear_exponent,
         }
 
 
